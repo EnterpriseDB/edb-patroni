@@ -19,22 +19,22 @@ from .callback_executor import CallbackAction, CallbackExecutor
 from .cancellable import CancellableSubprocess
 from .config import ConfigHandler, mtime
 from .connection import ConnectionPool, get_connection_cursor
-from .citus import CitusHandler
 from .misc import parse_history, parse_lsn, postgres_major_version_to_int
+from .mpp import AbstractMPP
 from .postmaster import PostmasterProcess
 from .slots import SlotsHandler
 from .sync import SyncHandler
-from .. import psycopg
+from .. import global_config, psycopg
 from ..async_executor import CriticalTask
 from ..collections import CaseInsensitiveSet
 from ..dcs import Cluster, Leader, Member, SLOT_ADVANCE_AVAILABLE_VERSION
 from ..exceptions import PostgresConnectionException
 from ..utils import Retry, RetryFailedError, polling_loop, data_directory_is_empty, parse_int
+from ..tags import Tags
 
 if TYPE_CHECKING:  # pragma: no cover
     from psycopg import Connection as Connection3, Cursor
     from psycopg2 import connection as connection3, cursor
-    from ..config import GlobalConfig
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ class Postgresql(object):
               "pg_catalog.pg_{0}_{1}_diff(COALESCE(pg_catalog.pg_last_{0}_receive_{1}(), '0/0'), '0/0')::bigint, "
               "pg_catalog.pg_is_in_recovery() AND pg_catalog.pg_is_{0}_replay_paused()")
 
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any], mpp: AbstractMPP) -> None:
         self.name: str = config['name']
         self.scope: str = config['scope']
         self._data_dir: str = config['data_dir']
@@ -73,7 +73,6 @@ class Postgresql(object):
         self.connection_string: str
         self.proxy_url: Optional[str]
         self._major_version = self.get_major_version()
-        self._global_config = None
 
         self._state_lock = Lock()
         self.set_state('stopped')
@@ -81,7 +80,7 @@ class Postgresql(object):
         self._pending_restart = False
         self.connection_pool = ConnectionPool()
         self._connection = self.connection_pool.get('heartbeat')
-        self.citus_handler = CitusHandler(self, config.get('citus'))
+        self.citus_handler = mpp.get_handler_impl(self)
         self.config = ConfigHandler(self, config)
         self.config.check_directories()
 
@@ -118,6 +117,8 @@ class Postgresql(object):
 
         # Last known running process
         self._postmaster_proc = None
+
+        self._available_gucs = None
 
         if self.is_running():
             # If we found postmaster process we need to figure out whether postgres is accepting connections
@@ -217,7 +218,7 @@ class Postgresql(object):
                          "FROM pg_catalog.pg_stat_get_wal_senders() w,"
                          " pg_catalog.pg_stat_get_activity(w.pid)"
                          " WHERE w.state = 'streaming') r)").format(self.wal_name, self.lsn_name)
-                        if (not self.global_config or self.global_config.is_synchronous_mode)
+                        if global_config.is_synchronous_mode
                         and self.role in ('master', 'primary', 'promoted') else "'on', '', NULL")
 
         if self._major_version >= 90600:
@@ -241,7 +242,9 @@ class Postgresql(object):
     @property
     def available_gucs(self) -> CaseInsensitiveSet:
         """GUCs available in this Postgres server."""
-        return self._get_gucs()
+        if not self._available_gucs:
+            self._available_gucs = self._get_gucs()
+        return self._available_gucs
 
     def _version_file_exists(self) -> bool:
         return not self.data_directory_empty() and os.path.isfile(self._version_file)
@@ -426,46 +429,30 @@ class Postgresql(object):
                 self.config.write_postgresql_conf()
                 self.reload()
 
-    @property
-    def global_config(self) -> Optional['GlobalConfig']:
-        return self._global_config
-
-    def reset_cluster_info_state(self, cluster: Union[Cluster, None], nofailover: bool = False,
-                                 global_config: Optional['GlobalConfig'] = None) -> None:
+    def reset_cluster_info_state(self, cluster: Optional[Cluster], tags: Optional[Tags] = None) -> None:
         """Reset monitoring query cache.
 
-        It happens in the beginning of heart-beat loop and on change of `synchronous_standby_names`.
+        .. note::
+            It happens in the beginning of heart-beat loop and on change of `synchronous_standby_names`.
 
         :param cluster: currently known cluster state from DCS
-        :param nofailover: whether this node could become a new primary.
-                           Important when there are logical permanent replication slots because "nofailover"
-                           node could do cascading replication and should enable `hot_standby_feedback`
-        :param global_config: last known :class:`GlobalConfig` object
+        :param tags: reference to an object implementing :class:`Tags` interface.
         """
         self._cluster_info_state = {}
 
-        if global_config:
-            self._global_config = global_config
-
-        if not self._global_config:
+        if not tags:
             return
 
-        if self._global_config.is_standby_cluster:
+        if global_config.is_standby_cluster:
             # Standby cluster can't have logical replication slots, and we don't need to enforce hot_standby_feedback
             self.set_enforce_hot_standby_feedback(False)
 
         if cluster and cluster.config and cluster.config.modify_version:
             # We want to enable hot_standby_feedback if the replica is supposed
             # to have a logical slot or in case if it is the cascading replica.
-            self.set_enforce_hot_standby_feedback(not self._global_config.is_standby_cluster and self.can_advance_slots
-                                                  and cluster.should_enforce_hot_standby_feedback(self.name,
-                                                                                                  nofailover))
-
-            self._has_permanent_slots = cluster.has_permanent_slots(
-                my_name=self.name,
-                is_standby_cluster=self._global_config.is_standby_cluster,
-                nofailover=nofailover,
-                major_version=self.major_version)
+            self.set_enforce_hot_standby_feedback(not global_config.is_standby_cluster and self.can_advance_slots
+                                                  and cluster.should_enforce_hot_standby_feedback(self, tags))
+            self._has_permanent_slots = cluster.has_permanent_slots(self, tags)
 
     def _cluster_info_state_get(self, name: str) -> Optional[Any]:
         if not self._cluster_info_state:
