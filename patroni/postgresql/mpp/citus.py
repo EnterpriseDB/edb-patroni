@@ -330,7 +330,7 @@ class PgDistTask(PgDistGroup):
         # If transaction was started, we need to COMMIT/ROLLBACK before the deadline
         self.timeout = timeout
         self.cooldown = cooldown or 10000  # 10s by default
-        self.deadline: float = 0
+        self.deadline: float = float('-inf')
 
         # All changes in the pg_dist_node are serialized on the Patroni
         # side by performing them from a thread. The thread, that is
@@ -403,7 +403,10 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         self._in_flight: Optional[PgDistTask] = None  # Reference to the `PgDistTask` being changed in a transaction
         self._schedule_load_pg_dist_group = True  # Flag that "pg_dist_group" should be queried from the database
         self._condition = Condition()  # protects _pg_dist_group, _tasks, _in_flight, and _schedule_load_pg_dist_group
+        self._ready_to_run = Event()
         self.schedule_cache_rebuild()
+        if self.is_coordinator():
+            self.start()
 
     def schedule_cache_rebuild(self) -> None:
         """Cache rebuild handler.
@@ -468,9 +471,8 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         if not self.is_coordinator():
             return
 
-        with self._condition:
-            if not self.is_alive():
-                self.start()
+        # notify run() method that it should start doing its job
+        self._ready_to_run.set()
 
         self.add_task('after_promote', CITUS_COORDINATOR_GROUP_ID, cluster,
                       self._postgresql.name, self._postgresql.connection_string)
@@ -569,7 +571,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             return True
         else:  # before_demote, before_promote
             if task.timeout:
-                task.deadline = time.time() + task.timeout
+                task.deadline = time.monotonic() + task.timeout
             if not self._in_flight:
                 self.query('BEGIN')
             self.update_group(task, True)
@@ -604,13 +606,16 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             task.wakeup()
 
     def run(self) -> None:
+        # we want to postpone "start" until first attempt to sync_meta_data
+        self._ready_to_run.wait()
+
         while True:
             try:
                 with self._condition:
                     if self._schedule_load_pg_dist_group:
                         timeout = -1
                     elif self._in_flight:
-                        timeout = self._in_flight.deadline - time.time() if self._tasks else None
+                        timeout = self._in_flight.deadline - time.monotonic() if self._tasks else None
                     else:
                         timeout = -1 if self._tasks else None
 
@@ -639,7 +644,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
                 # based on the outdated values of "state"/"role". To solve it we introduce an artificial timeout.
                 # Only when the timeout is reached new tasks could be scheduled from sync_meta_data()
                 if self._in_flight and self._in_flight.groupid == task.groupid and self._in_flight.timeout is not None\
-                        and self._in_flight.deadline > time.time():
+                        and self._in_flight.deadline > time.monotonic():
                     return False
 
             # Override already existing task for the same worker groupid
@@ -683,7 +688,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         return task if self._add_task(task) else None
 
     def handle_event(self, cluster: Cluster, event: Dict[str, Any]) -> None:
-        if not self.is_alive():
+        if not self._ready_to_run.is_set():
             return
 
         worker = cluster.workers.get(event['group'])

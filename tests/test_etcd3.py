@@ -79,6 +79,40 @@ class TestEtcd3Client(unittest.TestCase):
                             DnsCachingResolver())
         self.assertIsNotNone(etcd3._cluster_version)
 
+    @patch.object(urllib3.PoolManager, 'urlopen')
+    def test_get_members_retries_auth_errors(self, mock_urlopen):
+        auth_requests = []
+        member_list_requests = []
+
+        def urlopen_side_effect(method, url, **kwargs):
+            ret = MockResponse()
+            if method == 'GET' and url.endswith('/version'):
+                ret.content = '{"etcdserver": "3.6.10", "etcdcluster": "3.6.0"}'
+            elif url.endswith('/auth/authenticate'):
+                auth_requests.append(kwargs)
+                ret.content = '{{"token":"authtoken{0}"}}'.format(len(auth_requests))
+            elif url.endswith('/cluster/member/list'):
+                member_list_requests.append(kwargs)
+                if 1 < len(member_list_requests) < 4:
+                    ret.status_code = 401
+                    ret.content = '{"code":16,"error":"etcdserver: invalid auth token"}'
+                else:
+                    ret.content = '{"members":[{"clientURLs":["http://localhost:2379"]}]}'
+            return ret
+
+        mock_urlopen.side_effect = urlopen_side_effect
+        client = Etcd3Client({'host': '127.0.0.1', 'port': 2379, 'retry_timeout': 10, 'patronictl': True,
+                              'username': 'etcduser', 'password': 'etcdpassword'}, DnsCachingResolver())
+        client._update_machines_cache = True
+
+        kwargs = client._prepare_get_members(1)
+        self.assertEqual(client._get_members('http://127.0.0.1:2379', **kwargs), ['http://localhost:2379'])
+        self.assertEqual(len(auth_requests), 3)
+        self.assertEqual(json.loads(auth_requests[-1]['body']), {'name': 'etcduser', 'password': 'etcdpassword'})
+        self.assertNotIn('authorization', auth_requests[-1]['headers'])
+        self.assertEqual(len(member_list_requests), 4)
+        self.assertEqual(member_list_requests[-1]['headers']['authorization'], 'authtoken3')
+
 
 class BaseTestEtcd3(unittest.TestCase):
 
@@ -154,7 +188,7 @@ class TestPatroniEtcd3Client(BaseTestEtcd3):
         self.client.txn({'target': 'MOD', 'mod_revision': '1'},
                         {'request_delete_range': {'key': base64_encode('/patroni/test/leader')}})
 
-    @patch('time.time', Mock(side_effect=[1, 10.9, 100]))
+    @patch('time.monotonic', Mock(side_effect=[1, 10.9, 100]))
     def test__wait_cache(self):
         with self.kv_cache.condition:
             self.assertRaises(RetryFailedError, self.client._wait_cache, 10)
@@ -179,9 +213,9 @@ class TestPatroniEtcd3Client(BaseTestEtcd3):
         self.assertRaises(InvalidAuthToken, self.client.deleteprefix, 'foo')
         with patch.object(PatroniEtcd3Client, 'authenticate', Mock(return_value=True)):
             retry = self.etcd3._retry.copy()
-            with patch('time.time', Mock(side_effect=[0, 10, 20, 30, 40])):
+            with patch('time.monotonic', Mock(side_effect=[0, 10, 20, 30, 40])):
                 self.assertRaises(InvalidAuthToken, retry, self.client.deleteprefix, 'foo', retry=retry)
-            with patch('time.time', Mock(side_effect=[0, 10])):
+            with patch('time.monotonic', Mock(side_effect=[0, 10])):
                 self.assertRaises(InvalidAuthToken, self.client.deleteprefix, 'foo')
             self.client.username = None
             self.client._reauthenticate = False
@@ -197,13 +231,15 @@ class TestPatroniEtcd3Client(BaseTestEtcd3):
         self.assertRaises(etcd.EtcdException, self.client._handle_server_response, response)
         response.status_code = 400
         self.assertRaises(Unknown, self.client._handle_server_response, response)
-        response.content = '{"error":{"grpc_code":14,"message":"","http_code":400}}'
+        response.content = '{"error":{"code":14,"message":"","http_code":400}}'
+        self.assertRaises(socket.timeout, self.client._handle_server_response, response)
+        response.content = '{"error":{"code":2,"message":"not a primary lessor","http_code":400}}'
         self.assertRaises(socket.timeout, self.client._handle_server_response, response)
         response.content = '{"error":{"grpc_code":0,"message":"","http_code":400}}'
         try:
             self.client._handle_server_response(response)
-        except Unknown as e:
-            self.assertEqual(e.as_dict(), {'code': 2, 'codeText': 'OK', 'error': u'', 'status': 400})
+        except Etcd3ClientError as e:
+            self.assertEqual(e.as_dict(), {'code': 0, 'codeText': 'OK', 'error': u'', 'status': 400})
 
     @patch.object(urllib3.PoolManager, 'urlopen')
     def test__ensure_version_prefix(self, mock_urlopen):
@@ -275,14 +311,14 @@ class TestEtcd3(BaseTestEtcd3):
         self.etcd3._lease = None
         with patch.object(Etcd3Client, 'txn', Mock(return_value={'succeeded': True})):
             self.etcd3.update_leader(cluster, '123', failsafe={'foo': 'bar'})
-        self.etcd3._last_lease_refresh = 0
+        self.etcd3._last_lease_refresh = float('-inf')
         self.etcd3.update_leader(cluster, '124')
         with patch.object(PatroniEtcd3Client, 'lease_keepalive', Mock(return_value=True)), \
-                patch('time.time', Mock(side_effect=[0, 100, 200, 300])):
+                patch('time.monotonic', Mock(side_effect=[0, 100, 200, 300])):
             self.assertRaises(Etcd3Error, self.etcd3.update_leader, cluster, '126')
         self.etcd3._lease = cluster.leader.session
         self.etcd3.update_leader(cluster, '124')
-        self.etcd3._last_lease_refresh = 0
+        self.etcd3._last_lease_refresh = float('-inf')
         with patch.object(PatroniEtcd3Client, 'lease_keepalive', Mock(side_effect=Unknown)):
             self.assertFalse(self.etcd3.update_leader(cluster, '125'))
 
@@ -291,9 +327,9 @@ class TestEtcd3(BaseTestEtcd3):
 
     def test_attempt_to_acquire_leader(self):
         self.assertFalse(self.etcd3.attempt_to_acquire_leader())
-        with patch('time.time', Mock(side_effect=[0, 0, 0, 0, 0, 100, 200, 300])):
+        with patch('time.monotonic', Mock(side_effect=[0, 0, 0, 0, 0, 100, 200, 300])):
             self.assertFalse(self.etcd3.attempt_to_acquire_leader())
-        with patch('time.time', Mock(side_effect=[0, 100, 200, 300, 400])):
+        with patch('time.monotonic', Mock(side_effect=[0, 100, 200, 300, 400])):
             self.assertRaises(Etcd3Error, self.etcd3.attempt_to_acquire_leader)
         with patch.object(PatroniEtcd3Client, 'put', Mock(return_value=False)):
             self.assertFalse(self.etcd3.attempt_to_acquire_leader())
@@ -303,7 +339,7 @@ class TestEtcd3(BaseTestEtcd3):
 
     @patch.object(PatroniEtcd3Client, 'lease_keepalive', Mock(return_value=False))
     def test_refresh_lease(self):
-        self.etcd3._last_lease_refresh = 0
+        self.etcd3._last_lease_refresh = float('-inf')
         self.etcd3.refresh_lease()
 
     @patch('time.sleep', Mock(side_effect=SleepException))
@@ -311,7 +347,7 @@ class TestEtcd3(BaseTestEtcd3):
     @patch.object(PatroniEtcd3Client, 'lease_grant', Mock(side_effect=Etcd3ClientError))
     def test_create_lease(self):
         self.etcd3._lease = None
-        self.etcd3._last_lease_refresh = 0
+        self.etcd3._last_lease_refresh = float('-inf')
         self.assertRaises(SleepException, self.etcd3.create_lease)
 
     def test_set_failover_value(self):

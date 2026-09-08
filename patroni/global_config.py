@@ -205,6 +205,14 @@ class GlobalConfig(types.ModuleType):
             if 'primary_stop_timeout' in self.__config else self.get_int('master_stop_timeout', default)
 
     @property
+    def primary_race_backoff(self) -> int:
+        """Currently configured value of ``primary_race_backoff`` from the global configuration.
+
+        Assume ``0`` if it is not set or invalid.
+        """
+        return self.get_int('primary_race_backoff', 0)
+
+    @property
     def ignore_slots_matchers(self) -> List[Dict[str, Any]]:
         """Currently configured value of ``ignore_slots`` from the global configuration.
 
@@ -240,6 +248,15 @@ class GlobalConfig(types.ModuleType):
         Assume ``1800`` if it is not set or invalid.
         """
         return self.get_int('member_slots_ttl', 1800, base_unit='s')
+
+    @property
+    def manage_synchronized_standby_slots_enabled(self) -> bool:
+        """``True`` if dynamic ``synchronized_standby_slots`` management is enabled.
+
+        Depends on synchronous replication being enabled because Patroni derives the
+        ``synchronized_standby_slots`` value from the current set of synchronous standbys.
+        """
+        return self.is_synchronous_mode and self.use_slots and self.check_mode('manage_synchronized_standby_slots')
 
 
 sys.modules[__name__] = GlobalConfig()

@@ -45,7 +45,7 @@ Some of the PostgreSQL parameters **must hold the same values on the primary and
 - **max_worker_processes**: default value 8, minimal value 2
 - **max_prepared_transactions**: default value 0, minimal value 0
 - **wal_level**: default value hot_standby, accepted values: hot_standby, replica, logical
-- **track_commit_timestamp**: default value off 
+- **track_commit_timestamp**: default value off
 
 For the parameters below, PostgreSQL does not require equal values among the primary and all the replicas. However, considering the possibility of a replica to become the primary at any time, it doesn't really make sense to set them differently; therefore, **Patroni restricts setting their values to the** :ref:`dynamic configuration <dynamic_configuration>`.
 
@@ -136,7 +136,7 @@ Also the following Patroni configuration options **can be changed only dynamical
 
 - **ttl**: 30
 - **loop_wait**: 10
-- **retry_timeouts**: 10
+- **retry_timeout**: 10
 - **maximum_lag_on_failover**: 1048576
 - **max_timelines_history**: 0
 - **check_timeline**: false
@@ -198,7 +198,7 @@ Patroni configuration for a running instance
 Description
 """""""""""
 
-Generate a Patroni configuration in ``yaml`` format for the locally running PostgreSQL instance. 
+Generate a Patroni configuration in ``yaml`` format for the locally running PostgreSQL instance.
 Either the provided DSN (takes precedence) or PostgreSQL `environment variables <https://www.postgresql.org/docs/current/libpq-envars.html>`__ will be used for the PostgreSQL connection. If the password is not provided, it should be entered via prompt.
 
 All the non-internal GUCs defined in the source Postgres instance, independently if they were set through a configuration file, through the postmaster command-line, or through environment variables, will be used as the source for the following Patroni configuration parameters:
@@ -206,7 +206,7 @@ All the non-internal GUCs defined in the source Postgres instance, independently
    -  **scope**: ``cluster_name`` GUC value;
    -  **postgresql.listen**: ``listen_addresses`` and ``port`` GUC values;
    -  **postgresql.datadir**: ``data_directory`` GUC value;
-   -  **postgresql.parameters**: ``archive_command``, ``restore_command``, ``archive_cleanup_command``, ``recovery_end_command``, ``ssl_passphrase_command``, ``hba_file``, ``ident_file``, ``config_file`` GUC values;
+   -  **postgresql.parameters**: ``archive_command``, ``restore_command``, ``archive_cleanup_command``, ``recovery_end_command``, ``ssl_passphrase_command``, ``hba_file``, ``ident_file``, ``hosts_file``, ``config_file`` GUC values;
    -  **bootstrap.dcs**: all other gathered PostgreSQL GUCs.
 
 If ``scope``, ``postgresql.listen`` or ``postgresql.datadir`` is not set from the Postgres GUCs, the respective :ref:`Environment configuration <environment>` value is used.
@@ -219,6 +219,7 @@ Other rules applied for the values definition:
    -  **postgresql.authentication.superuser**: the configuration used for the instance connection;
    -  **postgresql.pg_hba**: the lines gathered from the source instance's ``hba_file``.
    -  **postgresql.pg_ident**: the lines gathered from the source instance's ``ident_file``.
+   -  **postgresql.pg_hosts**: the lines gathered from the source instance's ``hosts_file``.
    -  **restapi.listen**: IP address returned by ``gethostname`` call for the current machine's hostname and the standard ``8008`` port.
    -  **restapi.connect_address**: IP address returned by ``gethostname`` call for the current machine's hostname and the standard ``8008`` port.
 

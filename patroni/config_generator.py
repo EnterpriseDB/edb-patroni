@@ -7,7 +7,7 @@ import sys
 
 from contextlib import contextmanager
 from getpass import getpass, getuser
-from typing import Any, Dict, Iterator, List, Optional, TextIO, Tuple, TYPE_CHECKING, Union
+from typing import Any, Dict, Generator, Iterator, List, Optional, TextIO, Tuple, TYPE_CHECKING, Union
 
 import psutil
 import yaml
@@ -21,7 +21,7 @@ from .collections import EMPTY_DICT
 from .config import Config
 from .exceptions import PatroniException
 from .log import PatroniLogger
-from .postgresql.config import ConfigHandler, parse_dsn
+from .postgresql.config import AUTH_ALLOWED_PARAMETERS_VERSIONS, ConfigHandler, parse_dsn
 from .postgresql.misc import postgres_major_version_to_int
 from .utils import get_major_version, parse_bool, patch_config, read_stripped
 
@@ -321,8 +321,10 @@ class RunningClusterConfigGenerator(AbstractConfigGenerator):
 
         :returns: list of the parameter names.
         """
-        return ['hba_file', 'ident_file', 'config_file', 'data_directory'] + \
-            list(ConfigHandler.CMDLINE_OPTIONS.keys())
+        required = ['hba_file', 'ident_file', 'config_file', 'data_directory']
+        if self.pg_major and self.pg_major >= 190000:
+            required.append('hosts_file')
+        return required + list(ConfigHandler.CMDLINE_OPTIONS.keys())
 
     def _get_bin_dir_from_running_instance(self) -> str:
         """Define the directory postgres binaries reside using postmaster's pid executable.
@@ -352,7 +354,7 @@ class RunningClusterConfigGenerator(AbstractConfigGenerator):
             raise PatroniException("Obtained postmaster pid doesn't exist.")
 
     @contextmanager
-    def _get_connection_cursor(self) -> Iterator[Union['cursor', 'Cursor[Any]']]:
+    def _get_connection_cursor(self) -> Generator[Union['cursor', 'Cursor[Any]'], None, None]:
         """Get cursor for the PG connection established based on the stored information.
 
         :raises:
@@ -396,9 +398,9 @@ class RunningClusterConfigGenerator(AbstractConfigGenerator):
             elif param in ('archive_command', 'restore_command',
                            'archive_cleanup_command', 'recovery_end_command',
                            'ssl_passphrase_command', 'hba_file',
-                           'ident_file', 'config_file'):
+                           'ident_file', 'hosts_file', 'config_file'):
                 # write commands to the local config due to security implications
-                # write hba/ident/config_file to local config to ensure they are not removed later
+                # write hba/ident/hosts/config_file to local config to ensure they are not removed later
                 self.config['postgresql']['parameters'][param] = value
             elif param in helper_dict:
                 helper_dict[param] = value
@@ -434,12 +436,12 @@ class RunningClusterConfigGenerator(AbstractConfigGenerator):
         }
 
     def _set_conf_files(self) -> None:
-        """Extend :attr:`~RunningClusterConfigGenerator.config` with ``pg_hba.conf`` and ``pg_ident.conf`` content.
+        """Extend the generated config with the content of PostgreSQL authentication files.
 
         .. note::
-            This function only defines ``postgresql.pg_hba`` and ``postgresql.pg_ident`` when
-            ``hba_file`` and ``ident_file`` are set to the defaults. It may happen these files
-            are located outside of ``PGDATA`` and Patroni doesn't have write permissions for them.
+            This function only defines the corresponding Patroni parameters when the file GUCs are
+            set to the defaults. It may happen these files are located outside of ``PGDATA`` and
+            Patroni doesn't have write permissions for them.
 
         :raises:
             :exc:`~patroni.exceptions.PatroniException`: if :exc:`OSError` occurred during the conf files handling.
@@ -452,15 +454,16 @@ class RunningClusterConfigGenerator(AbstractConfigGenerator):
             except OSError as err:
                 raise PatroniException(f'Failed to read pg_hba.conf: {err}')
 
-        default_ident_path = os.path.join(self.config['postgresql']['data_dir'], 'pg_ident.conf')
-        if self.config['postgresql']['parameters']['ident_file'] == default_ident_path:
-            try:
-                self.config['postgresql']['pg_ident'] = [i for i in read_stripped(default_ident_path)
-                                                         if i and not i.startswith('#')]
-            except OSError as err:
-                raise PatroniException(f'Failed to read pg_ident.conf: {err}')
-            if not self.config['postgresql']['pg_ident']:
-                del self.config['postgresql']['pg_ident']
+        for ftype in ('ident', 'hosts'):
+            default_path = os.path.join(self.config['postgresql']['data_dir'], f'pg_{ftype}.conf')
+            if self.config['postgresql']['parameters'][f'{ftype}_file'] == default_path:
+                try:
+                    self.config['postgresql'][f'pg_{ftype}'] = [i for i in read_stripped(default_path)
+                                                                if i and not i.startswith('#')]
+                except OSError as err:
+                    raise PatroniException(f'Failed to read pg_{ftype}.conf: {err}')
+                if not self.config['postgresql'][f'pg_{ftype}']:
+                    del self.config['postgresql'][f'pg_{ftype}']
 
     def _enrich_config_from_running_instance(self) -> None:
         """Extend :attr:`~RunningClusterConfigGenerator.config` with the values gathered from the running instance.
@@ -470,7 +473,8 @@ class RunningClusterConfigGenerator(AbstractConfigGenerator):
         * superuser auth parameters (see :meth:`~RunningClusterConfigGenerator._set_su_params`);
         * some GUC values (see :meth:`~RunningClusterConfigGenerator._set_pg_params`);
         * ``postgresql.connect_address``, ``postgresql.listen``;
-        * ``postgresql.pg_hba`` and ``postgresql.pg_ident`` (see :meth:`~RunningClusterConfigGenerator._set_conf_files`)
+                * ``postgresql.pg_hba``, ``postgresql.pg_ident``, and ``postgresql.pg_hosts``
+                    (see :meth:`~RunningClusterConfigGenerator._set_conf_files`)
 
         And redefine ``scope`` with the ``cluster_name`` GUC value if set.
 
@@ -481,6 +485,10 @@ class RunningClusterConfigGenerator(AbstractConfigGenerator):
 
         with self._get_connection_cursor() as cur:
             self.pg_major = getattr(cur.connection, 'server_version', 0)
+            # Adjust version-specific allowed parameters
+            for param, min_version in AUTH_ALLOWED_PARAMETERS_VERSIONS.items():
+                if self.pg_major < min_version and param in self.config['postgresql']['authentication']['superuser']:
+                    del self.config['postgresql']['authentication']['superuser'][param]
 
             if not parse_bool(getattr(cur.connection, 'get_parameter_status')('is_superuser')):
                 raise PatroniException('The provided user does not have superuser privilege')

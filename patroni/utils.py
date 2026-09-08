@@ -25,7 +25,7 @@ import time
 from collections import OrderedDict
 from json import JSONDecoder
 from shlex import split
-from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Tuple, Type, TYPE_CHECKING, Union
+from typing import Any, Callable, cast, Dict, Iterator, List, Mapping, Optional, Tuple, Type, TYPE_CHECKING, Union
 
 from dateutil import tz
 from urllib3.response import HTTPResponse
@@ -79,7 +79,7 @@ def get_conversion_table(base_unit: str) -> Dict[str, Dict[str, Union[int, float
     return OrderedDict()
 
 
-def deep_compare(obj1: Dict[Any, Any], obj2: Dict[Any, Any]) -> bool:
+def deep_compare(obj1: Mapping[Any, Any], obj2: Mapping[Any, Any]) -> bool:
     """Recursively compare two dictionaries to check if they are equal in terms of keys and values.
 
     .. note::
@@ -111,8 +111,8 @@ def deep_compare(obj1: Dict[Any, Any], obj2: Dict[Any, Any]) -> bool:
         return False
 
     for key, value in obj1.items():
-        if isinstance(value, dict):
-            if not (isinstance(obj2[key], dict) and deep_compare(cast(Dict[Any, Any], value), obj2[key])):
+        if isinstance(value, Mapping):
+            if not (isinstance(obj2[key], Mapping) and deep_compare(cast(Mapping[Any, Any], value), obj2[key])):
                 return False
         elif str(value) != str(obj2[key]):
             return False
@@ -713,7 +713,7 @@ class Retry(object):
     @property
     def stoptime(self) -> float:
         """Get the current stop time."""
-        return self._cur_stoptime or 0
+        return float('-inf') if self._cur_stoptime is None else self._cur_stoptime
 
     def ensure_deadline(self, timeout: float, raise_ex: Optional[Exception] = None) -> bool:
         """Calculates and checks the remaining deadline time.
@@ -727,7 +727,7 @@ class Retry(object):
         :raises:
             :class:`Exception`: *raise_ex* if calculated deadline is smaller than provided *timeout*.
         """
-        if self.stoptime - time.time() < timeout:
+        if self.stoptime - time.monotonic() < timeout:
             if raise_ex:
                 raise raise_ex
             return False
@@ -759,7 +759,7 @@ class Retry(object):
         while True:
             try:
                 if self.deadline is not None and self._cur_stoptime is None:
-                    self._cur_stoptime = time.time() + self.deadline
+                    self._cur_stoptime = time.monotonic() + self.deadline
                 return func(*args, **kwargs)
             except self.retry_exceptions as e:
                 # Note: max_tries == -1 means infinite tries.
@@ -771,7 +771,7 @@ class Retry(object):
                 if not isinstance(sleeptime, (int, float)):
                     sleeptime = self.sleeptime
 
-                if self._cur_stoptime is not None and time.time() + sleeptime >= self._cur_stoptime:
+                if self._cur_stoptime is not None and time.monotonic() + sleeptime >= self._cur_stoptime:
                     logger.warning('Retry got exception: %s', e)
                     raise RetryFailedError("Exceeded retry deadline")
                 logger.debug('Retry got exception: %s', e)
@@ -790,10 +790,10 @@ def polling_loop(timeout: Union[int, float], interval: Union[int, float] = 1) ->
 
     :yields: current iteration counter, starting from ``0``.
     """
-    start_time = time.time()
+    start_time = time.monotonic()
     iteration = 0
     end_time = start_time + timeout
-    while time.time() < end_time:
+    while time.monotonic() < end_time:
         yield iteration
         iteration += 1
         time.sleep(float(interval))
@@ -971,7 +971,8 @@ def cluster_as_json(cluster: 'Cluster') -> Dict[str, Any]:
             member['host'] = conn_kwargs['host']
             if conn_kwargs.get('port'):
                 member['port'] = int(conn_kwargs['port'])
-        optional_attributes = ('timeline', 'pending_restart', 'pending_restart_reason', 'scheduled_restart', 'tags')
+        optional_attributes = ('timeline', 'pending_restart', 'pending_restart_reason',
+                               'scheduled_restart', 'tags', 'site')
         member.update({n: m.data[n] for n in optional_attributes if n in m.data})
 
         if m.name != leader_name:
@@ -1001,6 +1002,8 @@ def cluster_as_json(cluster: 'Cluster') -> Dict[str, Any]:
             ret['scheduled_switchover']['from'] = cluster.failover.leader
         if cluster.failover.candidate:
             ret['scheduled_switchover']['to'] = cluster.failover.candidate
+        elif cluster.failover.site:
+            ret['scheduled_switchover']['to'] = 'site ' + cluster.failover.site
     return ret
 
 
@@ -1280,3 +1283,86 @@ def get_major_version(bin_dir: Optional[str] = None, bin_name: str = 'postgres')
     """
     full_version = get_postgres_version(bin_dir, bin_name)
     return re.sub(r'\.\d+$', '', full_version)
+
+
+def process_user_options(tool: str, options: Any,
+                         not_allowed_options: Tuple[str, ...],
+                         error_handler: Callable[[str], None]) -> List[str]:
+    """Format *options* in a list or dictionary format into command line long form arguments.
+
+    :Example:
+
+        The *options* can be defined as a dictionary of key, values to be converted into arguments:
+        >>> process_user_options('foo', {'foo': 'bar'}, (), print)
+        ['--foo=bar']
+
+        Or as a list of single string arguments
+        >>> process_user_options('foo', ['yes'], (), print)
+        ['--yes']
+
+        Or as a list of key, value options
+        >>> process_user_options('foo', [{'foo': 'bar'}], (), print)
+        ['--foo=bar']
+
+        Or a combination of single and key, values
+        >>> process_user_options('foo', ['yes', {'foo': 'bar'}], (), print)
+        ['--yes', '--foo=bar']
+
+        Options that contain spaces are passed as is to ``subprocess.call``
+        >>> process_user_options('foo', [{'foo': 'bar baz'}], (), print)
+        ['--foo=bar baz']
+
+        Options that are quoted will be unquoted, so the quotes aren't interpreted
+        literally by the postgres command
+        >>> process_user_options('foo', [{'foo': '"bar baz"'}], (), print)
+        ['--foo=bar baz']
+
+    .. note::
+        The *error_handler* is called when any of these conditions are met:
+
+        * Key, value dictionaries in the list form contains multiple keys.
+        * If a key is listed in *not_allowed_options*.
+        * If the options list is not in the required structure.
+
+    :param tool: The name of the tool used in error reports to *error_handler*
+    :param options: Options to parse as a list of key, values or single values, or a dictionary
+    :param not_allowed_options: List of keys that cannot be used in the list of key, value formatted options
+    :param error_handler: A function which will be called when an error condition is encountered
+    :returns: List of long form arguments to pass to the named tool
+    """
+    user_options: List[str] = []
+
+    def option_is_allowed(name: str) -> bool:
+        ret = name not in not_allowed_options
+        if not ret:
+            error_handler('{0} option for {1} is not allowed'.format(name, tool))
+        return ret
+
+    if isinstance(options, dict):
+        for key, val in cast(Dict[str, str], options).items():
+            if key and val and option_is_allowed(key):
+                user_options.append('--{0}={1}'.format(key, unquote(val)))
+    elif isinstance(options, list):
+        for opt in cast(List[Any], options):
+            if isinstance(opt, str):
+                # This if needs to be nested, otherwise we confuse the user by logging two errors -- one issued by
+                # option_is_allowed and another by the else clause below.
+                if option_is_allowed(opt):
+                    user_options.append('--{0}'.format(opt))
+            elif isinstance(opt, dict):
+                args = cast(Dict[str, Any], opt)
+                keys = list(args.keys())
+                if len(keys) == 1 and isinstance(args[keys[0]], str):
+                    # This if needs to be nested, otherwise we confuse the user by logging two errors -- one issued by
+                    # option_is_allowed and another by the else clause below.
+                    if option_is_allowed(keys[0]):
+                        user_options.append('--{0}={1}'.format(keys[0], unquote(args[keys[0]])))
+                else:
+                    error_handler('Error when parsing {0} key-value option {1}: only one key-value is allowed'
+                                  ' and value should be a string'.format(tool, args[keys[0]]))
+            else:
+                error_handler('Error when parsing {0} option {1}: value should be string value'
+                              ' or a single key-value pair'.format(tool, opt))
+    else:
+        error_handler('{0} options must be list or dict'.format(tool))
+    return user_options

@@ -64,7 +64,7 @@ This is the synopsis for running a command from the ``patronictl``:
 .. code:: text
 
     patronictl [ { -c | --config-file } CONFIG_FILE ]
-      [ { -d | --dcs-url | --dcs } DCS_URL ] 
+      [ { -d | --dcs-url | --dcs } DCS_URL ]
       [ { -k | --insecure } ]
       SUBCOMMAND
 
@@ -81,6 +81,75 @@ This is the synopsis for running a command from the ``patronictl``:
     Also, when describing sub-commands in the following sub-sections, the commands' synopsis should be seen as a replacement for the ``SUBCOMMAND`` in the above synopsis.
 
 In the following sub-sections you can find a description of each command implemented by ``patronictl``. For sake of example, we will use the configuration files present in the GitHub repository of Patroni (files ``postgres0.yml``, ``postgres1.yml`` and ``postgres2.yml``).
+
+.. _patronictl_demote_cluster:
+
+patronictl demote-cluster
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. _patronictl_demote_cluster_synopsis:
+
+Synopsis
+""""""""
+
+.. code:: text
+
+    demote-cluster
+      [ CLUSTER_NAME ]
+      [ --host HOST ]
+      [ --port PORT ]
+      [ --restore-command RESTORE_COMMAND ]
+      [ --primary-slot-name PRIMARY_SLOT_NAME ]
+      [ --force ]
+
+.. _patronictl_demote_cluster_description:
+
+Description
+"""""""""""
+
+``patronictl demote-cluster`` converts a regular Patroni cluster into a :ref:`standby cluster <standby_cluster>`.
+
+The command patches the dynamic configuration with a ``standby_cluster`` section built from the provided remote primary connection options, then waits until the leader is running as a standby leader. It prints the current cluster topology before changing the configuration and asks for confirmation unless ``--force`` is used.
+
+At least one of ``--host``, ``--port`` or ``--restore-command`` must be specified.
+
+.. _patronictl_demote_cluster_parameters:
+
+Parameters
+""""""""""
+
+``CLUSTER_NAME``
+    Name of the Patroni cluster.
+
+    If not given, ``patronictl`` will attempt to fetch that from the ``scope`` configuration, if it exists.
+
+``--host``
+    Address of the remote node.
+
+``--port``
+    Port of the remote node.
+
+``--restore-command``
+    Command to restore WAL records from the remote primary.
+
+``--primary-slot-name``
+    Name of the replication slot on the remote node to use for replication.
+
+``--force``
+    Flag to skip confirmation prompts when demoting the cluster.
+
+    Useful for scripts.
+
+.. _patronictl_demote_cluster_examples:
+
+Examples
+""""""""
+
+Demote the cluster to a standby cluster that follows a remote primary endpoint:
+
+.. code:: bash
+
+    $ patronictl -c postgres0.yml demote-cluster batman --host 192.0.2.10 --port 5432 --primary-slot-name batman --force
 
 .. _patronictl_dsn:
 
@@ -202,7 +271,7 @@ Parameters
 
 ``--group``
     Change dynamic configuration of the given Citus group.
-    
+
     If not given, ``patronictl`` will attempt to fetch that from the ``citus.group`` configuration, if it exists.
 
     ``CITUS_GROUP`` is the ID of the Citus group.
@@ -321,6 +390,7 @@ Synopsis
       [ CLUSTER_NAME ]
       [ --group CITUS_GROUP ]
       --candidate CANDIDATE_NAME
+      [ --site SITE_NAME ]
       [ --force ]
 
 .. _patronictl_failover_description:
@@ -336,6 +406,8 @@ It is designed to be used when the cluster is not healthy, e.g.:
 - There is no synchronous standby available in a synchronous cluster.
 
 It also allows to fail over to an asynchronous node if synchronous mode is enabled.
+
+If ``--site`` is supplied, only members belonging to that site are considered when listing failover candidates for selection. Because failover requires an explicit candidate, the command still needs a candidate value to complete the operation.
 
 .. note::
     Nothing prevents you from running ``patronictl failover`` in a healthy cluster. However, we recommend using ``patronictl switchover`` in those cases.
@@ -362,6 +434,11 @@ Parameters
     The node to be promoted on failover.
 
     ``CANDIDATE_NAME`` is the name of the node to be promoted.
+
+``--site``
+    Restrict failover candidates to members that belong to the given site.
+
+    ``SITE_NAME`` is the site name configured for the Patroni nodes.
 
 ``--force``
     Flag to skip confirmation prompts when performing the failover.
@@ -566,7 +643,7 @@ Parameters
     Show history of events from the given Citus group.
 
     ``CITUS_GROUP`` is the ID of the Citus group.
-    
+
     If not given, ``patronictl`` will attempt to fetch that from the ``citus.group`` configuration, if it exists.
 
 ``-f`` / ``--format``
@@ -662,6 +739,11 @@ The following information is included in the output:
 
 ``Cluster``
     Name of the Patroni cluster.
+
+``Site``
+    Site of the Patroni node, as set in the local configuration.
+
+    If all members belong to the same site, the site is shown in the cluster header instead of as a column.
 
 ``Member``
     Name of the Patroni member.
@@ -819,6 +901,11 @@ Parameters
 
     ``TIME`` is the interval between refreshes, in seconds.
 
+``--site``
+    Filter the listed members by the configured site name.
+
+    Only members whose ``site`` matches the provided value are shown.
+
 .. _patronictl_list_examples:
 
 Examples
@@ -829,26 +916,26 @@ Show information about the cluster in pretty format:
 .. code:: bash
 
     $ patronictl -c postgres0.yml list batman
-    + Cluster: batman (7277694203142172922) -+-----------+----+-------------+-----+------------+-----+
-    | Member      | Host           | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
-    +-------------+----------------+---------+-----------+----+-------------+-----+------------+-----+
-    | postgresql0 | 127.0.0.1:5432 | Leader  | running   |  5 |             |     |            |     |
-    | postgresql1 | 127.0.0.1:5433 | Replica | streaming |  5 |   0/40004E8 |   0 |  0/40004E8 |   0 |
-    | postgresql2 | 127.0.0.1:5434 | Replica | streaming |  5 |   0/40004E8 |   0 |  0/40004E8 |   0 |
-    +-------------+----------------+---------+-----------+----+-------------+-----+------------+-----+
+    + Cluster: batman (7277694203142172922) --------+-----------+----+-------------+-----+------------+-----+
+    | Site | Member      | Host           | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
+    +------+-------------+----------------+---------+-----------+----+-------------+-----+------------+-----+
+    | dc1  | postgresql0 | 127.0.0.1:5432 | Leader  | running   |  5 |             |     |            |     |
+    | dc1  | postgresql1 | 127.0.0.1:5433 | Replica | streaming |  5 |   0/40004E8 |   0 |  0/40004E8 |   0 |
+    | dc2  | postgresql2 | 127.0.0.1:5434 | Replica | streaming |  5 |   0/40004E8 |   0 |  0/40004E8 |   0 |
+    +------+-------------+----------------+---------+-----------+----+-------------+-----+------------+-----+
 
 Show information about the cluster in pretty format with extended columns:
 
 .. code:: bash
 
     $ patronictl -c postgres0.yml list batman -e
-    + Cluster: batman (7277694203142172922) -+-----------+----+-------------+-----+------------+-----+-----------------+------------------------+-------------------+------+
-    | Member      | Host           | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag | Pending restart | Pending restart reason | Scheduled restart | Tags |
-    +-------------+----------------+---------+-----------+----+-------------+-----+------------+-----+-----------------+------------------------+-------------------+------+
-    | postgresql0 | 127.0.0.1:5432 | Leader  | running   |  5 |             |     |            |     |                 |                        |                   |      |
-    | postgresql1 | 127.0.0.1:5433 | Replica | streaming |  5 |   0/40004E8 |   0 |  0/40004E8 |   0 |                 |                        |                   |      |
-    | postgresql2 | 127.0.0.1:5434 | Replica | streaming |  5 |   0/40004E8 |   0 |  0/40004E8 |   0 |                 |                        |                   |      |
-    +-------------+----------------+---------+-----------+----+-------------+-----+------------+-----+-----------------+------------------------+-------------------+------+
+    + Cluster: batman (7277694203142172922) --------+-----------+----+-------------+-----+------------+-----+-----------------+------------------------+-------------------+------+
+    | Site | Member      | Host           | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag | Pending restart | Pending restart reason | Scheduled restart | Tags |
+    +------+-------------+----------------+---------+-----------+----+-------------+-----+------------+-----+-----------------+------------------------+-------------------+------+
+    | dc1  | postgresql0 | 127.0.0.1:5432 | Leader  | running   |  5 |             |     |            |     |                 |                        |                   |      |
+    | dc1  | postgresql1 | 127.0.0.1:5433 | Replica | streaming |  5 |   0/40004E8 |   0 |  0/40004E8 |   0 |                 |                        |                   |      |
+    | dc2  | postgresql2 | 127.0.0.1:5434 | Replica | streaming |  5 |   0/40004E8 |   0 |  0/40004E8 |   0 |                 |                        |                   |      |
+    +------+-------------+----------------+---------+-----------+----+-------------+-----+------------+-----+-----------------+------------------------+-------------------+------+
 
 Show information about the cluster in YAML format, with timestamp of execution:
 
@@ -860,6 +947,7 @@ Show information about the cluster in YAML format, with timestamp of execution:
       Host: 127.0.0.1:5432
       Member: postgresql0
       Role: Leader
+      Site: dc1
       State: running
       TL: 5
     - Cluster: batman
@@ -870,6 +958,7 @@ Show information about the cluster in YAML format, with timestamp of execution:
       Replay Lag: 0
       Member: postgresql1
       Role: Replica
+      Site: dc1
       State: streaming
       TL: 5
     - Cluster: batman
@@ -880,6 +969,7 @@ Show information about the cluster in YAML format, with timestamp of execution:
       Replay Lag: 0
       Member: postgresql2
       Role: Replica
+      Site: dc2
       State: streaming
       TL: 5
 
@@ -921,7 +1011,7 @@ Parameters
     Pause the given Citus group.
 
     ``CITUS_GROUP`` is the ID of the Citus group.
-    
+
     If not given, ``patronictl`` will attempt to fetch that from the ``citus.group`` configuration, if it exists.
 
 ``--wait``
@@ -939,6 +1029,57 @@ Put the cluster in maintenance mode, and wait until all nodes have been paused:
     $ patronictl -c postgres0.yml pause batman --wait
     'pause' request sent, waiting until it is recognized by all nodes
     Success: cluster management is paused
+
+.. _patronictl_promote_cluster:
+
+patronictl promote-cluster
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. _patronictl_promote_cluster_synopsis:
+
+Synopsis
+""""""""
+
+.. code:: text
+
+    promote-cluster
+      [ CLUSTER_NAME ]
+      [ --force ]
+
+.. _patronictl_promote_cluster_description:
+
+Description
+"""""""""""
+
+``patronictl promote-cluster`` converts a standby cluster into a regular Patroni cluster.
+
+The command removes the ``standby_cluster`` section from the dynamic configuration and waits until the leader is running as the primary. It prints the current cluster topology before changing the configuration and asks for confirmation unless ``--force`` is used.
+
+.. _patronictl_promote_cluster_parameters:
+
+Parameters
+""""""""""
+
+``CLUSTER_NAME``
+    Name of the Patroni cluster.
+
+    If not given, ``patronictl`` will attempt to fetch that from the ``scope`` configuration, if it exists.
+
+``--force``
+    Flag to skip confirmation prompts when promoting the cluster.
+
+    Useful for scripts.
+
+.. _patronictl_promote_cluster_examples:
+
+Examples
+""""""""
+
+Promote the standby cluster to run as a regular Patroni cluster:
+
+.. code:: bash
+
+    $ patronictl -c postgres0.yml promote-cluster batman --force
 
 .. _patronictl_query:
 
@@ -1452,7 +1593,7 @@ Parameters
 ``--pending``
     Select only members which are flagged as ``Pending restart``.
 
-``timeout``
+``--timeout``
     Abort the restart if it takes more than the specified timeout, and fail over to a replica if the issue is on the primary.
 
     ``TIMEOUT`` is the amount of seconds to wait before aborting the restart.
@@ -1556,7 +1697,7 @@ Parameters
     Resume the given Citus group.
 
     ``CITUS_GROUP`` is the ID of the Citus group.
-    
+
     If not given, ``patronictl`` will attempt to fetch that from the ``citus.group`` configuration, if it exists.
 
 ``--wait``
@@ -1612,7 +1753,7 @@ Parameters
     Show dynamic configuration of the given Citus group.
 
     ``CITUS_GROUP`` is the ID of the Citus group.
-    
+
     If not given, ``patronictl`` will attempt to fetch that from the ``citus.group`` configuration, if it exists.
 
 .. _patronictl_show_config_examples:
@@ -1652,7 +1793,9 @@ Synopsis
       [ CLUSTER_NAME ]
       [ --group CITUS_GROUP ]
       [ { --leader | --primary } LEADER_NAME ]
-      --candidate CANDIDATE_NAME
+      [ --candidate CANDIDATE_NAME ]
+      [ --site SITE_NAME ]
+      [ --scheduled TIMESTAMP ]
       [ --force ]
 
 .. _patronictl_switchover_description:
@@ -1666,6 +1809,8 @@ It is designed to be used when the cluster is healthy, e.g.:
 
 - There is a leader;
 - There are synchronous standbys available in a synchronous cluster.
+
+If ``--site`` is supplied, only members belonging to that site are considered when listing switchover candidates for selection. Unlike failover, switchover can be performed with a site filter even if no explicit candidate is provided.
 
 .. note::
     If your cluster is unhealthy you might be interested in ``patronictl failover`` instead.
@@ -1694,6 +1839,11 @@ Parameters
     The node to be promoted on switchover, and take the primary role.
 
     ``CANDIDATE_NAME`` is the name of the node to be promoted.
+
+``--site``
+    Restrict switchover candidates to members that belong to the given site.
+
+    ``SITE_NAME`` is the site name configured for the Patroni nodes.
 
 ``--scheduled``
     Schedule a switchover to occur at the given timestamp.

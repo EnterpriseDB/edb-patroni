@@ -243,7 +243,7 @@ class K8sClient(object):
             self.pool_manager = urllib3.PoolManager(**k8s_config.pool_config)
             self._base_uri = k8s_config.server
             self._api_servers_cache = [k8s_config.server]
-            self._api_servers_cache_updated = 0
+            self._api_servers_cache_updated = float('-inf')
             self.set_api_servers_cache_ttl(10)
             self.set_read_timeout(10)
             try:
@@ -330,10 +330,11 @@ class K8sClient(object):
 
             if self._base_uri not in self._api_servers_cache:
                 self.set_base_uri(self._api_servers_cache[0])
-            self._api_servers_cache_updated = time.time()
+            self._api_servers_cache_updated = time.monotonic()
 
         def refresh_api_servers_cache(self) -> None:
-            if self._bypass_api_service and time.time() - self._api_servers_cache_updated > self._api_servers_cache_ttl:
+            if self._bypass_api_service and \
+                    time.monotonic() - self._api_servers_cache_updated > self._api_servers_cache_ttl:
                 self._refresh_api_servers_cache()
 
         def _load_api_servers_cache(self) -> None:
@@ -426,7 +427,7 @@ class K8sClient(object):
                     if TYPE_CHECKING:  # pragma: no cover
                         assert isinstance(retry, Retry)  # K8sConnectionFailed is raised only if retry is not None!
                     sleeptime = retry.sleeptime
-                    remaining_time = (retry.stoptime or time.time()) - sleeptime - time.time()
+                    remaining_time = retry.stoptime - sleeptime - time.monotonic()
                     nodes, timeout, retries = self._calculate_timeouts(api_servers, remaining_time)
                     if nodes == 0:
                         self._update_api_servers_cache = True
@@ -558,10 +559,11 @@ class CoreV1ApiProxy(object):
             func = func[:-4] + ('endpoints' if self._use_endpoints else 'config_map')
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            retriable_http_codes = self._retriable_http_codes | set(kwargs.pop('_retriable_http_codes', None) or [])
             try:
                 return getattr(self._core_v1_api, func)(*args, **kwargs)
             except k8s_client.rest.ApiException as e:
-                if e.status in self._retriable_http_codes or e.headers and 'retry-after' in e.headers:
+                if e.status in retriable_http_codes or e.headers and 'retry-after' in e.headers:
                     raise KubernetesRetriableException(e)
                 raise
         return wrapper
@@ -857,7 +859,7 @@ class Kubernetes(AbstractDCS):
 
     def _wait_caches(self, stop_time: float) -> None:
         while not (self._pods.is_ready() and self._kinds.is_ready()):
-            timeout = stop_time - time.time()
+            timeout = stop_time - time.monotonic()
             if timeout <= 0:
                 raise RetryFailedError('Exceeded retry deadline')
             self._condition.wait(timeout)
@@ -907,7 +909,10 @@ class Kubernetes(AbstractDCS):
         if leader_path == self.leader_path and (leader_record or self._leader_observed_record)\
                 and leader_record != self._leader_observed_record:
             self._leader_observed_record = leader_record
-            self._leader_observed_time = time.time()
+            # Use monotonic time: _leader_observed_time is used for a local TTL check
+            # (measuring elapsed time since leader was last observed), not for comparison
+            # with external timestamps, so monotonic time is appropriate.
+            self._leader_observed_time = time.monotonic()
 
         leader = leader_record.get(self._LEADER)
         try:
@@ -916,8 +921,10 @@ class Kubernetes(AbstractDCS):
             ttl = self._ttl
 
         # We want to check validity of the leader record only for our own cluster
+        # Using monotonic time for local TTL duration check (see above).
         if leader_path == self.leader_path and\
-                not (metadata and self._leader_observed_time and self._leader_observed_time + ttl >= time.time()):
+                not (metadata and self._leader_observed_time is not None
+                     and self._leader_observed_time + ttl >= time.monotonic()):
             leader = None
 
         if metadata:
@@ -975,7 +982,7 @@ class Kubernetes(AbstractDCS):
     ) -> Union[Cluster, Dict[int, Cluster]]:
         if TYPE_CHECKING:  # pragma: no cover
             assert self._retry.deadline is not None
-        stop_time = time.time() + self._retry.deadline
+        stop_time = time.monotonic() + self._retry.deadline
         self._api.refresh_api_servers_cache()
         try:
             with self._condition:
@@ -1187,17 +1194,18 @@ class Kubernetes(AbstractDCS):
                                   resource_version: Optional[str], ips: List[str]) -> bool:
         retry = self._retry.copy()
 
-        def _retry(*args: Any, **kwargs: Any) -> Any:
-            kwargs['_retry'] = retry
+        def _retry_403(*args: Any, **kwargs: Any) -> Any:
+            kwargs.update(_retry=retry, _retriable_http_codes=frozenset([403]))
             return retry(*args, **kwargs)
 
         try:
-            return bool(self._patch_or_create(self.leader_path, annotations, resource_version, ips=ips, retry=_retry))
+            return bool(self._patch_or_create(self.leader_path, annotations, resource_version,
+                                              ips=ips, retry=_retry_403))
         except k8s_client.rest.ApiException as e:
             if e.status == 409:
                 logger.warning('Concurrent update of %s', self.leader_path)
             else:
-                logger.exception('Permission denied' if e.status == 403 else 'Unexpected error from Kubernetes API')
+                logger.exception('Unexpected error from Kubernetes API')
                 return False
         except (RetryFailedError, K8sException) as e:
             raise KubernetesError(e)
@@ -1205,6 +1213,10 @@ class Kubernetes(AbstractDCS):
         # if we are here, that means update failed with 409
         if not retry.ensure_deadline(1):
             return False  # No time for retry. Tell ha.py that we have to demote due to failed update.
+
+        def _retry(*args: Any, **kwargs: Any) -> Any:
+            kwargs['_retry'] = retry
+            return retry(*args, **kwargs)
 
         # Try to get the latest version directly from K8s API instead of relying on async cache
         try:
@@ -1251,7 +1263,8 @@ class Kubernetes(AbstractDCS):
         leader_observed_record = kind_annotations or self._leader_observed_record
         annotations = {self._LEADER: self._name, 'ttl': str(self._ttl), 'renewTime': now,
                        'acquireTime': leader_observed_record.get('acquireTime') or now,
-                       'transitions': leader_observed_record.get('transitions') or '0'}
+                       'transitions': leader_observed_record.get('transitions') or '0',
+                       'current_site': self.site}
         if last_lsn:
             annotations[self._OPTIME] = str(last_lsn)
             annotations['slots'] = json.dumps(slots, separators=(',', ':')) if slots else None
@@ -1340,10 +1353,11 @@ class Kubernetes(AbstractDCS):
         """Unused"""
         raise NotImplementedError  # pragma: no cover
 
-    def manual_failover(self, leader: Optional[str], candidate: Optional[str],
-                        scheduled_at: Optional[datetime.datetime] = None, version: Optional[str] = None) -> bool:
+    def manual_failover(self, leader: Optional[str], candidate: Optional[str], site: Optional[str],
+                        scheduled_at: Optional[datetime.datetime] = None, version: Optional[str] = None
+                        ) -> bool:
         annotations = {'leader': leader or None, 'member': candidate or None,
-                       'scheduled_at': scheduled_at and scheduled_at.isoformat()}
+                       'scheduled_at': scheduled_at and scheduled_at.isoformat(), 'site': site or None}
         patch = bool(self.cluster and isinstance(self.cluster.failover, Failover) and self.cluster.failover.version)
         return bool(self.patch_or_create(self.failover_path, annotations, version, bool(version or patch), False))
 

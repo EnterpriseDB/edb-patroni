@@ -11,7 +11,7 @@ from copy import deepcopy
 from datetime import datetime
 from enum import IntEnum
 from threading import current_thread, Lock
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, TYPE_CHECKING, Union
 
 from dateutil import tz
 from psutil import TimeoutExpired
@@ -19,8 +19,10 @@ from psutil import TimeoutExpired
 from .. import global_config, psycopg
 from ..async_executor import CriticalTask
 from ..collections import CaseInsensitiveDict, CaseInsensitiveSet, EMPTY_DICT
-from ..dcs import Cluster, Leader, Member, slot_name_from_member_name
+from ..daemon import notify_systemd
+from ..dcs import Cluster, Leader, Member, RemoteMember, slot_name_from_member_name
 from ..exceptions import PostgresConnectionException
+from ..site import ClusterSite
 from ..tags import Tags
 from ..utils import data_directory_is_empty, parse_int, polling_loop, Retry, RetryFailedError
 from .bootstrap import Bootstrap
@@ -63,7 +65,7 @@ def null_context():
     yield
 
 
-class Postgresql(object):
+class Postgresql(ClusterSite):
 
     POSTMASTER_START_TIME = "pg_catalog.pg_postmaster_start_time()"
     TL_LSN = ("CASE WHEN pg_catalog.pg_is_in_recovery() THEN 0 "
@@ -76,6 +78,8 @@ class Postgresql(object):
               "pg_catalog.pg_is_in_recovery() AND pg_catalog.pg_is_{0}_replay_paused()")
 
     def __init__(self, config: Dict[str, Any], mpp: AbstractMPP) -> None:
+        super(Postgresql, self).__init__(config.get('site'))
+
         self.name: str = config['name']
         self.scope: str = config['scope']
         self._data_dir: str = config['data_dir']
@@ -96,11 +100,11 @@ class Postgresql(object):
         self._bin_dir = config.get('bin_dir') or ''
         self._role_lock = Lock()
         self.set_role(PostgresqlRole.UNINITIALIZED)
+        self.bootstrap = Bootstrap(self)
+        self.bootstrapping = False
         self.config = ConfigHandler(self, config)
         self.config.check_directories()
 
-        self.bootstrap = Bootstrap(self)
-        self.bootstrapping = False
         self.__thread_ident = current_thread().ident
 
         self.slots_handler = SlotsHandler(self)
@@ -121,7 +125,7 @@ class Postgresql(object):
                                       retry_exceptions=PostgresConnectionException)
 
         self.set_role(self.get_postgres_role_from_data_directory())
-        self._state_entry_timestamp = 0
+        self._state_entry_timestamp = float('-inf')
 
         self._cluster_info_state = {}
         self._should_query_slots = True
@@ -146,13 +150,14 @@ class Postgresql(object):
 
             hba_saved = self.config.replace_pg_hba()
             ident_saved = self.config.replace_pg_ident()
+            hosts_saved = self.config.replace_pg_hosts()
 
             if self.major_version < 120000 or self.role == PostgresqlRole.PRIMARY:
                 # If PostgreSQL is running as a primary or we run PostgreSQL that is older than 12 we can
                 # call reload_config() once again (the first call happened in the ConfigHandler constructor),
                 # so that it can figure out if config files should be updated and pg_ctl reload executed.
-                self.config.reload_config(config, sighup=bool(hba_saved or ident_saved))
-            elif hba_saved or ident_saved:
+                self.config.reload_config(config, sighup=bool(hba_saved or ident_saved or hosts_saved))
+            elif hba_saved or ident_saved or hosts_saved:
                 self.reload()
         elif not self.is_running() and self.role == PostgresqlRole.PRIMARY:
             self.set_role(PostgresqlRole.DEMOTED)
@@ -210,6 +215,11 @@ class Postgresql(object):
         return self.major_version >= 110000
 
     @property
+    def supports_synchronized_standby_slots(self) -> bool:
+        """``True`` if the ``synchronized_standby_slots`` GUC is supported by Postgres."""
+        return self.major_version >= 170000
+
+    @property
     def cluster_info_query(self) -> str:
         """Returns the monitoring query with a fixed number of fields.
 
@@ -240,12 +250,9 @@ class Postgresql(object):
                         and self.role in (PostgresqlRole.PRIMARY, PostgresqlRole.PROMOTED) else "'on', '', NULL")
 
         if self._major_version >= 90600:
-            filter_failover = ' WHERE NOT failover' if self._major_version >= 170000 else ''
+            pg_replication_slots_query = self.slots_handler.pg_replication_slots_query(True)
             extra = ("pg_catalog.current_setting('restore_command')" if self._major_version >= 120000 else "NULL") +\
-                ", " + ("(SELECT pg_catalog.json_agg(s.*) FROM (SELECT slot_name, slot_type as type, datoid::bigint, "
-                        "plugin, catalog_xmin, pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint"
-                        " AS confirmed_flush_lsn, pg_catalog.pg_wal_lsn_diff(restart_lsn, '0/0')::bigint"
-                        f" AS restart_lsn, xmin FROM pg_catalog.pg_get_replication_slots(){filter_failover}) AS s)"
+                ", " + (f"(SELECT pg_catalog.json_agg(s.*) FROM ({pg_replication_slots_query}) AS s)"
                         if self._should_query_slots and self.can_advance_slots else "NULL") + extra
 
             written_lsn = ("pg_catalog.pg_wal_lsn_diff(written_lsn, '0/0')::bigint"
@@ -426,6 +433,18 @@ class Postgresql(object):
         except RetryFailedError as exc:
             raise PostgresConnectionException(str(exc)) from exc
 
+    def was_restored_from_backup(self) -> bool:
+        """Check whether the data directory was restored from a base backup.
+
+        The presence of a ``backup_label`` file in the data directory indicates that PostgreSQL has not yet
+        completed recovery from a base backup. It is checked only for PostgreSQL 15+, because earlier versions
+        supported exclusive backups which could leave a stale ``backup_label`` behind after a primary crash.
+
+        :returns: ``True`` if running on PostgreSQL 15 or newer and the ``backup_label`` file exists in the
+            data directory, ``False`` otherwise.
+        """
+        return self._major_version >= 150000 and os.path.isfile(os.path.join(self._data_dir, 'backup_label'))
+
     def pg_control_exists(self) -> bool:
         return os.path.isfile(self._pg_control)
 
@@ -498,6 +517,11 @@ class Postgresql(object):
                     cluster_info_state['slots'] =\
                         self.slots_handler.process_permanent_slots(cluster_info_state['slots'])
                 self._cluster_info_state = cluster_info_state
+            except psycopg.OperationalError as e:
+                if e.diag.sqlstate == '57014':  # QueryCanceled
+                    self._cluster_info_state = {'error': str(e)}
+                else:
+                    raise
             except RetryFailedError as e:  # SELECT failed two times
                 self._cluster_info_state = {'error': str(e)}
                 if not self.is_starting() and self.pg_isready() == PgIsReadyStatus.REJECT:
@@ -667,7 +691,7 @@ class Postgresql(object):
         # we noticed that postgres was restarted, force syncing of replication slots and check of logical slots
         self.slots_handler.schedule()
 
-        self._postmaster_proc = PostmasterProcess.from_pidfile(self._data_dir)
+        self._postmaster_proc = PostmasterProcess.from_pidfile(self.pgcommand('postgres'), self._data_dir)
         return self._postmaster_proc
 
     @property
@@ -708,10 +732,10 @@ class Postgresql(object):
     def set_state(self, value: PostgresqlState) -> None:
         with self._state_lock:
             self._state = value
-            self._state_entry_timestamp = time.time()
+            self._state_entry_timestamp = time.monotonic()
 
     def time_in_state(self) -> float:
-        return time.time() - self._state_entry_timestamp
+        return time.monotonic() - self._state_entry_timestamp
 
     def is_starting(self) -> bool:
         return self.state in (PostgresqlState.STARTING, PostgresqlState.BOOTSTRAP_STARTING)
@@ -779,6 +803,7 @@ class Postgresql(object):
         self.config.resolve_connection_addresses()
         self.config.replace_pg_hba()
         self.config.replace_pg_ident()
+        self.config.replace_pg_hosts()
 
         options = ['--{0}={1}'.format(p, configuration[p]) for p in self.config.CMDLINE_OPTIONS
                    if p in configuration and p not in ('wal_keep_segments', 'wal_keep_size')]
@@ -823,20 +848,16 @@ class Postgresql(object):
     def checkpoint(self, connect_kwargs: Optional[Dict[str, Any]] = None,
                    timeout: Optional[float] = None) -> Optional[str]:
         check_not_is_in_recovery = connect_kwargs is not None
-        connect_kwargs = connect_kwargs or self.connection_pool.conn_kwargs
-        for p in ['connect_timeout', 'options']:
-            connect_kwargs.pop(p, None)
-        if timeout:
-            connect_kwargs['connect_timeout'] = timeout
+        conn_kwargs = {**(connect_kwargs or self.connection_pool.conn_kwargs),
+                       'connect_timeout': timeout, 'options': '-c statement_timeout=0'}
         try:
-            with get_connection_cursor(**connect_kwargs) as cur:
-                cur.execute("SET statement_timeout = 0")
+            with get_connection_cursor(**conn_kwargs) as cur:
                 if check_not_is_in_recovery:
                     cur.execute('SELECT pg_catalog.pg_is_in_recovery()')
                     row = cur.fetchone()
                     if not row or row[0]:
                         return 'is_in_recovery=true'
-                cur.execute('CHECKPOINT')
+                cur.execute('CHECKPOINT (FLUSH_UNLOGGED)' if self.major_version >= 190000 else 'CHECKPOINT')
         except psycopg.Error:
             logger.exception('Exception during CHECKPOINT')
             return 'not accessible or not healthy'
@@ -899,11 +920,14 @@ class Postgresql(object):
                 on_safepoint()
             return success, True
 
-        # We can skip safepoint detection if we don't have a callback
-        if on_safepoint:
-            # Wait for our connection to terminate so we can be sure that no new connections are being initiated
-            self._wait_for_connection_close(postmaster)
-            postmaster.wait_for_user_backends_to_close(stop_timeout)
+        # Wait for our connection to terminate to detect that PostgreSQL started shutting down.
+        self._wait_for_connection_close(postmaster)
+        # If the stopped PostgreSQL was started before Patroni (e.g. a takeover) it may have
+        # had NOTIFY_SOCKET in its environment and sent STOPPING=1 to systemd on shutdown.
+        # Re-assert READY=1 to counteract that when NotifyAccess=all is configured.
+        notify_systemd("READY=1")
+
+        if on_safepoint and postmaster.wait_for_user_backends_to_close(stop_timeout):
             on_safepoint()
 
         if on_shutdown and mode in ('fast', 'smart'):
@@ -915,6 +939,8 @@ class Postgresql(object):
                     checkpoint_lsn, prev_lsn = self.latest_checkpoint_locations(data)
                     if checkpoint_lsn is not None and prev_lsn is not None:
                         on_shutdown(checkpoint_lsn, prev_lsn)
+                        if on_safepoint:
+                            on_safepoint()
                     break
                 elif data.get('Database cluster state', '').startswith('shut down'):  # shut down in recovery
                     break
@@ -931,6 +957,8 @@ class Postgresql(object):
             if not self.terminate_postmaster(postmaster, mode, stop_timeout):
                 postmaster.wait()
 
+        if on_safepoint:
+            on_safepoint()
         return True, True
 
     def terminate_postmaster(self, postmaster: PostmasterProcess, mode: str,
@@ -1088,10 +1116,11 @@ class Postgresql(object):
 
     @contextmanager
     def get_replication_connection_cursor(self, host: Optional[str] = None, port: Union[int, str] = 5432,
-                                          **kwargs: Any) -> Iterator[Union['cursor', 'Cursor[Any]']]:
-        conn_kwargs = self.config.replication.copy()
-        conn_kwargs.update(host=host, port=int(port) if port else None, user=conn_kwargs.pop('username'),
-                           connect_timeout=3, replication=1, options='-c statement_timeout=2000')
+                                          **kwargs: Any) -> Generator[Union['cursor', 'Cursor[Any]'], None, None]:
+        # We use RemoteMember here because it has the logic to map and sanitize connection parameters
+        member = RemoteMember('', {'conn_kwargs': {'host': host, 'port': port}})
+        conn_kwargs = member.conn_kwargs(self.config.replication)
+        conn_kwargs.update(replication=1)
         with get_connection_cursor(**conn_kwargs) as cur:
             yield cur
 

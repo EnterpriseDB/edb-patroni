@@ -139,9 +139,9 @@ class MockCursor(object):
         elif sql.startswith('SELECT slot_name, slot_type, datname, plugin, catalog_xmin'):
             self.results = [('ls', 'logical', 'a', 'b', 100, 500, b'123456')]
         elif sql.startswith('SELECT slot_name'):
-            self.results = [('blabla', 'physical', 1, 12345),
-                            ('foobar', 'physical', 1, 12345),
-                            ('ls', 'logical', 1, 499, 'b', 'a', 5, 100, 500)]
+            self.results = [('blabla', 'physical', 1, 12345, None, None, None, None, None, 'reserved'),
+                            ('foobar', 'physical', 1, 12345, None, None, None, None, None, 'reserved'),
+                            ('ls', 'logical', 1, 499, 'b', 'a', 5, 100, 500, 'reserved', False, False)]
         elif sql.startswith('WITH slots AS (SELECT slot_name, active'):
             self.results = [(False, True)] if self.rowcount == 1 else []
         elif sql.startswith('SELECT CASE WHEN pg_catalog.pg_is_in_recovery()'):
@@ -158,6 +158,7 @@ class MockCursor(object):
             self.results = [('data_directory', 'data'),
                             ('hba_file', os.path.join('data', 'pg_hba.conf')),
                             ('ident_file', os.path.join('data', 'pg_ident.conf')),
+                            ('hosts_file', os.path.join('data', 'pg_hosts.conf')),
                             ('max_connections', 42),
                             ('max_locks_per_transaction', 73),
                             ('max_prepared_transactions', 0),
@@ -209,6 +210,8 @@ class MockCursor(object):
 
 class MockConnect(object):
 
+    pgconn = None
+    connection = None
     server_version = 99999
     autocommit = False
     closed = 0
@@ -248,6 +251,8 @@ class PostgresInit(unittest.TestCase):
 
     @patch('patroni.psycopg._connect', psycopg_connect)
     @patch('patroni.postgresql.CallbackExecutor', Mock())
+    @patch('patroni.postgresql.mpp.citus.CitusHandler.start', Mock())
+    @patch('patroni.postgresql.slots.SlotsAdvanceThread.start', Mock())
     @patch.object(ConfigHandler, 'write_postgresql_conf', Mock())
     @patch.object(ConfigHandler, 'replace_pg_hba', Mock())
     @patch.object(ConfigHandler, 'replace_pg_ident', Mock())

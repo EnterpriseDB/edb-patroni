@@ -22,12 +22,12 @@ class TestCitus(BaseTestPostgresql):
         self.cluster = get_cluster_initialized_with_leader()
         self.cluster.workers[1] = self.cluster
 
-    @patch('time.time', Mock(side_effect=[100, 130, 160, 190, 220, 250, 280, 310, 340, 370, 400, 430, 460, 490]))
+    @patch('time.monotonic', Mock(side_effect=[100, 130, 160, 190, 220, 250, 280, 310, 340, 370, 400, 430, 460, 490]))
     @patch('patroni.postgresql.mpp.citus.logger.exception', Mock(side_effect=SleepException))
     @patch('patroni.postgresql.mpp.citus.logger.warning')
     @patch('patroni.postgresql.mpp.citus.PgDistTask.wait', Mock())
-    @patch.object(CitusHandler, 'is_alive', Mock(return_value=True))
     def test_run(self, mock_logger_warning):
+        self.c._ready_to_run.set()
         # `before_demote` or `before_promote` REST API calls starting a
         # transaction. We want to make sure that it finishes during
         # certain timeout. In case if it is not, we want to roll it back
@@ -43,7 +43,6 @@ class TestCitus(BaseTestPostgresql):
         self.assertTrue(mock_logger_warning.call_args[0][0].startswith('Rolling back transaction'))
         self.assertTrue(repr(mock_logger_warning.call_args[0][1]).startswith('PgDistTask'))
 
-    @patch.object(CitusHandler, 'is_alive', Mock(return_value=False))
     @patch.object(CitusHandler, 'start', Mock())
     def test_sync_meta_data(self):
         with patch.object(CitusHandler, 'is_enabled', Mock(return_value=False)):
@@ -52,9 +51,9 @@ class TestCitus(BaseTestPostgresql):
 
     def test_handle_event(self):
         self.c.handle_event(self.cluster, {})
-        with patch.object(CitusHandler, 'is_alive', Mock(return_value=True)):
-            self.c.handle_event(self.cluster, {'type': 'after_promote', 'group': 2,
-                                               'leader': 'leader', 'timeout': 30, 'cooldown': 10})
+        self.c._ready_to_run.set()
+        self.c.handle_event(self.cluster, {'type': 'after_promote', 'group': 2,
+                                           'leader': 'leader', 'timeout': 30, 'cooldown': 10})
 
     def test_add_task(self):
         with patch('patroni.postgresql.mpp.citus.logger.error') as mock_logger, \
@@ -80,10 +79,10 @@ class TestCitus(BaseTestPostgresql):
         self.assertIsNone(self.c.add_task('after_promote', 1, self.cluster,
                                           self.cluster.leader_name, 'postgres://host:5432/postgres'))
         self.c._in_flight = self.c._tasks.pop()
-        self.c._in_flight.deadline = self.c._in_flight.timeout + time.time()
+        self.c._in_flight.deadline = self.c._in_flight.timeout + time.monotonic()
         self.assertIsNone(self.c.add_task('after_promote', 1, self.cluster,
                                           self.cluster.leader_name, 'postgres://host:5432/postgres'))
-        self.c._in_flight.deadline = 0
+        self.c._in_flight.deadline = float('-inf')
         self.assertIsNotNone(self.c.add_task('after_promote', 1, self.cluster,
                                              self.cluster.leader_name, 'postgres://host:5432/postgres'))
 
@@ -133,7 +132,7 @@ class TestCitus(BaseTestPostgresql):
     @patch('patroni.postgresql.mpp.citus.logger.error')
     @patch.object(MockCursor, 'execute', Mock(side_effect=Exception))
     def test_load_pg_dist_group(self, mock_logger):
-        # load_pg_dist_group) triggers, query fails and exception is property handled
+        # load_pg_dist_group() triggers, query fails and exception is property handled
         self.c.process_tasks()
         self.assertTrue(self.c._schedule_load_pg_dist_group)
         mock_logger.assert_called_once()

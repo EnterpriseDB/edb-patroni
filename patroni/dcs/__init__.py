@@ -19,6 +19,7 @@ import dateutil.parser
 from .. import global_config
 from ..dynamic_loader import iter_classes, iter_modules
 from ..exceptions import PatroniAssertionError, PatroniFatalException
+from ..site import ClusterSite
 from ..tags import Tags
 from ..utils import deep_compare, parse_int, uri
 
@@ -130,7 +131,7 @@ def get_dcs(config: Union['Config', Dict[str, Any]]) -> 'AbstractDCS':
     for name, dcs_class in iter_dcs_classes(config):
         # Propagate some parameters from top level of config if defined to the DCS specific config section.
         config[name].update({
-            p: config[p] for p in ('namespace', 'name', 'scope', 'loop_wait',
+            p: config[p] for p in ('namespace', 'name', 'scope', 'site', 'loop_wait',
                                    'patronictl', 'ttl', 'retry_timeout')
             if p in config})
 
@@ -258,8 +259,10 @@ class Member(Tags, NamedTuple('Member',
             self.data['conn_kwargs'] = ret.copy()
 
         # apply any remaining authentication parameters
+        # we skip options and connect_timeout to prevent injection via config file
         if auth and isinstance(auth, dict):
-            ret.update({k: v for k, v in cast(Dict[str, Any], auth).items() if v is not None})
+            ret.update({k: v for k, v in cast(Dict[str, Any], auth).items()
+                        if k not in ('options', 'connect_timeout') and v is not None})
             if 'username' in auth:
                 ret['user'] = ret.pop('username')
         return ret
@@ -334,6 +337,10 @@ class Member(Tags, NamedTuple('Member',
     @property
     def replay_lsn(self) -> Optional[int]:
         return parse_int(self.data.get('replay_lsn'))
+
+    @property
+    def site(self) -> Optional[str]:
+        return self.data.get('site')
 
 
 class RemoteMember(Member):
@@ -446,6 +453,7 @@ class Failover(NamedTuple):
     :ivar candidate: the name of the member node to be considered as a failover candidate.
     :ivar scheduled_at: in the case of a switchover the :class:`~datetime.datetime` object to perform the scheduled
         switchover.
+    :ivar site: the name of the site to perform a cross-site switchover to.
 
     :Example:
 
@@ -481,6 +489,7 @@ class Failover(NamedTuple):
     leader: Optional[str]
     candidate: Optional[str]
     scheduled_at: Optional[datetime.datetime]
+    site: Optional[str]
 
     @staticmethod
     def from_node(version: _Version, value: Union[str, Dict[str, str]]) -> 'Failover':
@@ -508,14 +517,14 @@ class Failover(NamedTuple):
                 t = [a.strip() for a in value.split(':')]
                 leader = t[0]
                 candidate = t[1] if len(t) > 1 else None
-                return Failover(version, leader, candidate, None)
+                return Failover(version, leader, candidate, None, None)
         else:
             data = {}
 
         if data.get('scheduled_at'):
             data['scheduled_at'] = dateutil.parser.parse(data['scheduled_at'])
 
-        return Failover(version, data.get('leader'), data.get('member'), data.get('scheduled_at'))
+        return Failover(version, data.get('leader'), data.get('member'), data.get('scheduled_at'), data.get('site'))
 
     def __len__(self) -> int:
         """Implement ``len`` function capability.
@@ -536,7 +545,7 @@ class Failover(NamedTuple):
            This makes it easier to write ``if cluster.failover`` rather than the longer statement.
 
         """
-        return int(bool(self.leader)) + int(bool(self.candidate))
+        return int(bool(self.leader)) + int(bool(self.candidate)) + int(bool(self.site))
 
 
 class ClusterConfig(NamedTuple):
@@ -779,10 +788,12 @@ class Status(NamedTuple):
     :ivar last_lsn: :class:`int` object containing position of last known leader LSN.
     :ivar slots: state of permanent replication slots on the primary in the format: ``{"slot_name": int}``.
     :ivar retain_slots: list physical replication slots for members that exist in the cluster.
+    :ivar current_site: the name of the site where leader is located.
     """
     last_lsn: int
     slots: Optional[Dict[str, int]]
     retain_slots: List[str]
+    current_site: Optional[str]
 
     @staticmethod
     def empty() -> 'Status':
@@ -790,14 +801,14 @@ class Status(NamedTuple):
 
         :returns: empty :class:`Status` object.
         """
-        return Status(0, None, [])
+        return Status(0, None, [], None)
 
     def is_empty(self):
         """Validate definition of all attributes of this :class:`Status` instance.
 
         :returns: ``True`` if all attributes of the current :class:`Status` are unpopulated.
         """
-        return self.last_lsn == 0 and self.slots is None and not self.retain_slots
+        return self.last_lsn == 0 and self.slots is None and not self.retain_slots and self.current_site is None
 
     @staticmethod
     def from_node(value: Union[str, Dict[str, Any], None]) -> 'Status':
@@ -814,7 +825,7 @@ class Status(NamedTuple):
             return Status.empty()
 
         if isinstance(value, int):  # legacy
-            return Status(value, None, [])
+            return Status(value, None, [], None)
 
         if not isinstance(value, dict):
             return Status.empty()
@@ -842,7 +853,7 @@ class Status(NamedTuple):
         if not isinstance(retain_slots, list):
             retain_slots = []
 
-        return Status(last_lsn, slots, retain_slots)
+        return Status(last_lsn, slots, retain_slots, value.get('current_site'))
 
 
 class Cluster(NamedTuple('Cluster',
@@ -918,7 +929,7 @@ class Cluster(NamedTuple('Cluster',
 
            >>> assert bool(cluster) is False
 
-           >>> status = Status(0, None, [])
+           >>> status = Status(0, None, [], 'dc1')
            >>> cluster = Cluster(None, None, None, status, [1, 2, 3], None, SyncState.empty(), None, None, {})
            >>> len(cluster)
            1
@@ -962,17 +973,26 @@ class Cluster(NamedTuple('Cluster',
         return next((m for m in self.members if m.name == member_name),
                     self.leader if fallback_to_leader else None)
 
-    def get_clone_member(self, exclude_name: str) -> Union[Member, Leader, None]:
+    def get_clone_member(self, exclude_name: str, site: Optional[str]) -> Union[Member, Leader, None]:
         """Get member or leader object to use as clone source.
 
         :param exclude_name: name of a member name to exclude.
+        :param site: the site to which the clone member should belong.
 
         :returns: a randomly selected candidate member from available running members that are configured to as viable
                  sources for cloning (has tag ``clonefrom`` in configuration). If no member is appropriate the current
-                 leader is used.
+                 leader is used. If there is neither replica nor leader in the requested site, choose among all
+                 available members.
         """
         exclude = [exclude_name] + ([self.leader.name] if self.leader else [])
+
         candidates = [m for m in self.members if m.clonefrom and m.is_running and m.name not in exclude]
+        local_candidates = [m for m in candidates if (site is None or m.site == site)]
+        if len(local_candidates) > 0:
+            candidates = local_candidates
+        elif self.leader and site and self.leader.member.site == site:
+            # prefer local leader over remote replicas
+            candidates = [self.leader]
         return candidates[randint(0, len(candidates) - 1)] if candidates else self.leader
 
     @staticmethod
@@ -1442,7 +1462,7 @@ def catch_return_false_exception(func: Callable[..., Any]) -> Any:
     return wrapper
 
 
-class AbstractDCS(abc.ABC):
+class AbstractDCS(ClusterSite, abc.ABC):
     """Abstract representation of DCS modules.
 
     Implementations of a concrete DCS class, using appropriate backend client interfaces, must include the following
@@ -1531,6 +1551,8 @@ class AbstractDCS(abc.ABC):
                        i.e.: ``zookeeper`` for zookeeper, ``etcd`` for etcd, etc...
         :param mpp: an object implementing :class:`AbstractMPP` interface.
         """
+        ClusterSite.__init__(self, config.get('site'))
+
         self._mpp = mpp
         self._name = config['name']
         self._base_path = re.sub('/+', '/', '/'.join(['', config.get('namespace', 'service'), config['scope']]))
@@ -1538,7 +1560,7 @@ class AbstractDCS(abc.ABC):
 
         self._ctl = bool(config.get('patronictl', False))
         self._cluster: Optional[Cluster] = None
-        self._cluster_valid_till: float = 0
+        self._cluster_valid_till: float = float('-inf')
         self._cluster_thread_lock = Lock()
         self._last_lsn: int = 0
         self._last_seen: int = 0
@@ -1766,10 +1788,13 @@ class AbstractDCS(abc.ABC):
 
         with self._cluster_thread_lock:
             self._cluster = cluster
-            self._cluster_valid_till = time.time() + self.ttl
+            self._cluster_valid_till = time.monotonic() + self.ttl
 
+            # Intentionally use wall-clock time: _last_seen is exposed via the REST API and may
+            # be compared with timestamps from other nodes, so it must be a real (system) timestamp.
             self._last_seen = int(time.time())
-            self._last_status = {self._OPTIME: cluster.status.last_lsn, 'retain_slots': cluster.status.retain_slots}
+            self._last_status = {self._OPTIME: cluster.status.last_lsn, 'retain_slots': cluster.status.retain_slots,
+                                 'current_site': cluster.status.current_site}
             if cluster.status.slots:
                 self._last_status['slots'] = cluster.status.slots
             self._last_failsafe = cluster.failsafe
@@ -1780,13 +1805,13 @@ class AbstractDCS(abc.ABC):
     def cluster(self) -> Optional[Cluster]:
         """Cached DCS cluster information that has not yet expired."""
         with self._cluster_thread_lock:
-            return self._cluster if self._cluster_valid_till > time.time() else None
+            return self._cluster if self._cluster_valid_till > time.monotonic() else None
 
     def reset_cluster(self) -> None:
         """Clear cached state of DCS."""
         with self._cluster_thread_lock:
             self._cluster = None
-            self._cluster_valid_till = 0
+            self._cluster_valid_till = float('-inf')
 
     @abc.abstractmethod
     def _write_leader_optime(self, last_lsn: str) -> bool:
@@ -1831,7 +1856,7 @@ class AbstractDCS(abc.ABC):
         """
         # This method is always called with ``optime`` key, rest of the keys are optional.
         # In case if we know old values (stored in self._last_status), we will copy them over.
-        for name in ('slots', 'retain_slots'):
+        for name in ('slots', 'retain_slots', 'current_site'):
             if name not in value and self._last_status.get(name):
                 value[name] = self._last_status[name]
         # if the key is present, but the value is None, we will not write such pair.
@@ -1884,7 +1909,7 @@ class AbstractDCS(abc.ABC):
 
         :returns: the list of replication slots to be written to ``/status`` key or ``None``.
         """
-        timestamp = time.time()
+        timestamp = time.monotonic()
 
         if slots:  # if slots is not empty it implies we are running v11+
             members: Set[str] = set()
@@ -1947,6 +1972,8 @@ class AbstractDCS(abc.ABC):
         if ret and last_lsn:
             status: Dict[str, Any] = {self._OPTIME: last_lsn, 'slots': slots or None,
                                       'retain_slots': self._build_retain_slots(cluster, slots)}
+            if self.site:
+                status['current_site'] = self.site
             self.write_status(status)
 
         if ret and failsafe is not None:
@@ -1982,7 +2009,7 @@ class AbstractDCS(abc.ABC):
         """
         ret = self.attempt_to_acquire_leader()
         if ret:
-            timestamp = time.time()
+            timestamp = time.monotonic()
             # every time we promote we need to reset retention time for slots recorded in the /status key
             self._last_retain_slots = {name: timestamp for name in self._last_status['retain_slots']}
         return ret
@@ -1997,12 +2024,13 @@ class AbstractDCS(abc.ABC):
         :returns: ``True`` if successfully committed to DCS.
         """
 
-    def manual_failover(self, leader: Optional[str], candidate: Optional[str],
+    def manual_failover(self, leader: Optional[str], candidate: Optional[str], site: Optional[str],
                         scheduled_at: Optional[datetime.datetime] = None, version: Optional[Any] = None) -> bool:
         """Prepare dictionary with given values and set ``/failover`` key in DCS.
 
         :param leader: value to set for ``leader``.
         :param candidate: value to set for ``member``.
+        :param site: value to set for ``site``.
         :param scheduled_at: value converted to ISO date format for ``scheduled_at``.
         :param version: for conditional update of the key/object.
 
@@ -2014,9 +2042,12 @@ class AbstractDCS(abc.ABC):
 
         if candidate:
             failover_value['member'] = candidate
+        elif site:
+            failover_value['site'] = site
 
         if scheduled_at:
             failover_value['scheduled_at'] = scheduled_at.isoformat()
+
         return self.set_failover_value(json.dumps(failover_value, separators=(',', ':')), version)
 
     @abc.abstractmethod

@@ -10,15 +10,16 @@ import shutil
 from collections import defaultdict
 from contextlib import contextmanager
 from threading import Condition, Thread
-from typing import Any, Collection, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Collection, Dict, Generator, List, Optional, Tuple, TYPE_CHECKING, Union
 
 from .. import global_config
-from ..dcs import Cluster, Leader
+from ..dcs import Cluster, Leader, slot_name_from_member_name
 from ..file_perm import pg_perm
 from ..psycopg import OperationalError
 from ..tags import Tags
 from .connection import get_connection_cursor
 from .misc import format_lsn, fsync_dir, PostgresqlRole
+from .sync import SYNC_STRICT_PLACEHOLDER
 
 if TYPE_CHECKING:  # pragma: no cover
     from psycopg import Cursor
@@ -188,10 +189,12 @@ class SlotsHandler:
         self._force_readiness_check = False
         self._schedule_load_slots = False
         self._postgresql = postgresql
-        self._advance = None
+        self._advance = SlotsAdvanceThread(self)
         self._replication_slots: Dict[str, Dict[str, Any]] = {}  # already existing replication slots
         self._logical_slots_processing_queue: Dict[str, Optional[int]] = {}
         self.pg_replslot_dir = os.path.join(self._postgresql.data_dir, 'pg_replslot')
+        # Track the last known state of manage_synchronized_standby_slots feature to detect toggles
+        self._last_manage_sync_slots_enabled: Optional[bool] = None
         self.schedule()
 
     def _query(self, sql: str, *params: Any) -> List[Tuple[Any, ...]]:
@@ -204,15 +207,91 @@ class SlotsHandler:
         """
         return self._postgresql.query(sql, *params, retry=False)
 
-    @staticmethod
-    def _copy_items(src: Dict[str, Any], dst: Dict[str, Any], keys: Optional[Collection[str]] = None) -> None:
-        """Select values from *src* dictionary to update in *dst* dictionary for optional supplied *keys*.
+    def handle_manage_sync_slots_toggle(self, sync_members: Collection[str], num: Optional[int] = None) -> None:
+        """Handle ``manage_synchronized_standby_slots`` feature toggle.
+
+        Detects edges between the feature being enabled and disabled and either pushes
+        a fresh dynamic value (when toggled on) or restores the user-configured value
+        (when toggled off).
+
+        :param sync_members: currently active synchronous standby members, used to compute
+                              the dynamic value of ``synchronized_standby_slots`` when the
+                              feature is being toggled on.
+        :param num: number of nodes to sync to, forwarded to :meth:`update_synchronized_standby_slots`.
+                    It is set only when quorum commit is enabled.
+        """
+        if not self._postgresql.supports_synchronized_standby_slots:
+            return
+
+        if self._last_manage_sync_slots_enabled == global_config.manage_synchronized_standby_slots_enabled:
+            return
+
+        self.update_synchronized_standby_slots(sync_members, num=num, reload=True)
+
+    def update_synchronized_standby_slots(self, sync_members: Collection[str],
+                                          num: Optional[int] = None, reload: bool = False) -> bool:
+        """Update ``synchronized_standby_slots`` based on sync members for PostgreSQL 17+.
+
+        Converts *sync_members* to their corresponding slot names and writes them to the
+        ``synchronized_standby_slots`` GUC. Does nothing if running on PostgreSQL older than 17.
+
+        Also detects ``manage_synchronized_standby_slots`` feature toggles on every call, regardless
+        of the calling code path: when the feature is switched off, the user-configured value of
+        ``synchronized_standby_slots`` is restored (or the parameter is cleared if none configured).
+        This way a toggle-off is never missed, even when it is observed from a call that is otherwise
+        a no-op (e.g. *sync_members* unchanged).
+
+        :param sync_members: set of currently active synchronous standby member names.
+                             If it contains ``*`` (any standby is allowed to be synchronous), or is empty
+                             while *num* is >= 1, the ``synchronized_standby_slots`` GUC is set to the
+                             strict sync placeholder. If empty and *num* is not set, the GUC is cleared.
+        :param num: number of nodes to sync to. It is set only when quorum commit is enabled.
+        :param reload: whether to write ``postgresql.conf`` and reload PostgreSQL if the value changed.
+
+        :returns: ``True`` if the value of ``synchronized_standby_slots`` was updated, ``False`` otherwise.
+        """
+        if not self._postgresql.supports_synchronized_standby_slots:
+            return False
+
+        feature_enabled = global_config.manage_synchronized_standby_slots_enabled
+        just_disabled = self._last_manage_sync_slots_enabled and not feature_enabled
+        self._last_manage_sync_slots_enabled = feature_enabled
+
+        if just_disabled:
+            value = self._postgresql.config.synchronized_standby_slots
+            return self._postgresql.config.set_synchronized_standby_slots(value, reload=reload)
+
+        if not feature_enabled:
+            return False
+
+        # Special case. If sync_members contains the '*' wildcard, or the set is empty while the
+        # requested num of sync nodes is >= 1, we want to set synchronized_standby_slots to
+        # '__patroni_strict_sync_replica_placeholder__'
+        sync_strict = '*' in sync_members or num and num >= 1 and not sync_members
+        if sync_strict:
+            slot_names = [SYNC_STRICT_PLACEHOLDER]
+        else:
+            slot_names = [slot_name_from_member_name(member) for member in sorted(sync_members) if member != '*']
+
+        sync_param = None if not slot_names else ','.join(slot_names)
+        return self._postgresql.config.set_synchronized_standby_slots(sync_param, reload=reload)
+
+    def copy_slot_items(self, src: Dict[str, Any], dst: Dict[str, Any], is_logical: bool = True) -> None:
+        """Select values from *src* slots dictionary to update in *dst* slots dictionary.
 
         :param src: source dictionary that *keys* will be looked up from.
         :param dst: destination dictionary to be updated.
-        :param keys: optional list of keys to be looked up in the source dictionary.
+        :param is_logical: whether the slot type is logical.
         """
-        dst.update({key: src[key] for key in keys or ('datoid', 'catalog_xmin', 'confirmed_flush_lsn')})
+        if is_logical:
+            keys = ('datoid', 'catalog_xmin', 'confirmed_flush_lsn')
+            if self._postgresql.major_version >= 170000:
+                keys += ('failover', 'synced')
+        else:
+            keys = ('restart_lsn', 'xmin')
+        if self._postgresql.major_version >= 130000:
+            keys += ('wal_status',)
+        dst.update({key: src[key] for key in keys if key in src})
 
     def process_permanent_slots(self, slots: List[Dict[str, Any]]) -> Dict[str, int]:
         """Process replication slot information from the host and prepare information used in subsequent cluster tasks.
@@ -244,10 +323,10 @@ class SlotsHandler:
                 if compare_slots(value, self._replication_slots[name], 'datoid'):
                     if value['type'] == 'logical':
                         ret[name] = value['confirmed_flush_lsn']
-                        self._copy_items(value, self._replication_slots[name])
+                        self.copy_slot_items(value, self._replication_slots[name])
                     else:
                         ret[name] = value['restart_lsn']
-                        self._copy_items(value, self._replication_slots[name], ('restart_lsn', 'xmin'))
+                        self.copy_slot_items(value, self._replication_slots[name], is_logical=False)
                 else:
                     self._schedule_load_slots = True
 
@@ -257,43 +336,63 @@ class SlotsHandler:
 
         return ret
 
+    def pg_replication_slots_query(self, use_function: bool = False) -> str:
+        """Get query text for retrieveing slots infromation.
+
+        Query retrieves replication slot's ``name``, ``type``, ``plugin``, ``database`` and ``datoid``.
+        If PostgreSQL version is 10 or newer also retrieves ``catalog_xmin`` and ``confirmed_flush_lsn``.
+        If PostgreSQL version is 17 or above also retrieves ``failover`` and ``synced``.
+
+        :param use_function: whether to use ``pg_get_replication_slots()`` function or ``pg_replication_slots`` view
+                             in the query.
+
+        :return: string containing SQL query text.
+        """
+        pg_wal_lsn_diff = f"pg_catalog.pg_{self._postgresql.wal_name}_{self._postgresql.lsn_name}_diff"
+
+        extra = f", catalog_xmin, {pg_wal_lsn_diff}(confirmed_flush_lsn, '0/0')::bigint AS confirmed_flush_lsn" \
+            if self._postgresql.major_version >= 100000 else ""
+        extra += ", wal_status" if self._postgresql.major_version >= 130000 else ""
+        extra += ", failover, synced" if self._postgresql.major_version >= 170000 else ""
+
+        filter_columns = ["NOT temporary"] if self._postgresql.major_version >= 100000 else []
+        filter_columns += ["(NOT failover OR NOT synced)"] if self._postgresql.major_version >= 170000 else []
+
+        where_filter = ' AND '.join(filter_columns)
+        where_condition = f' WHERE {where_filter}' if where_filter else ''
+
+        database = '' if use_function else ', database'
+        pg_replication_slots_obj = "pg_get_replication_slots()" if use_function else 'pg_replication_slots'
+
+        return "SELECT slot_name, slot_type AS type, xmin, " \
+            f"{pg_wal_lsn_diff}(restart_lsn, '0/0')::bigint AS restart_lsn, plugin{database}, " \
+            f"datoid::bigint{extra} FROM pg_catalog.{pg_replication_slots_obj}{where_condition}"
+
     def load_replication_slots(self) -> None:
         """Query replication slot information from the database and store it for processing by other tasks.
 
         .. note::
             Only supported from PostgreSQL version 9.4 onwards.
 
-        Store replication slot ``name``, ``type``, ``plugin``, ``database`` and ``datoid``.
-        If PostgreSQL version is 10 or newer also store ``catalog_xmin`` and ``confirmed_flush_lsn``.
-
-        When using logical slots, store information separately for slot synchronisation  on replica nodes.
+        When using logical slots, store information separately for slot synchronisation on replica nodes.
         """
         if self._postgresql.major_version >= 90400 and self._schedule_load_slots:
             replication_slots: Dict[str, Dict[str, Any]] = {}
-            pg_wal_lsn_diff = f"pg_catalog.pg_{self._postgresql.wal_name}_{self._postgresql.lsn_name}_diff"
-            extra = f", catalog_xmin, {pg_wal_lsn_diff}(confirmed_flush_lsn, '0/0')::bigint" \
-                if self._postgresql.major_version >= 100000 else ""
-            filter_columns = tuple(fltr for fltr, major in (('temporary', 100000), ('failover', 170000))
-                                   if self._postgresql.major_version >= major)
-            where_filter = ' AND '.join(map(lambda col: f'NOT {col}', filter_columns))
-            where_condition = f' WHERE {where_filter}' if where_filter else ''
-            for r in self._query("SELECT slot_name, slot_type, xmin, "
-                                 f"{pg_wal_lsn_diff}(restart_lsn, '0/0')::bigint, plugin, database, datoid{extra}"
-                                 f" FROM pg_catalog.pg_replication_slots{where_condition}"):
+            for r in self._query(self.pg_replication_slots_query()):
                 value = {'type': r[1]}
                 if r[1] == 'logical':
                     value.update(plugin=r[4], database=r[5], datoid=r[6])
                     if self._postgresql.major_version >= 100000:
                         value.update(catalog_xmin=r[7], confirmed_flush_lsn=r[8])
+                    if self._postgresql.major_version >= 170000:
+                        value.update(failover=r[10], synced=r[11])
                 else:
                     value.update(xmin=r[2], restart_lsn=r[3])
+                if self._postgresql.major_version >= 130000:
+                    value.update(wal_status=r[9])
                 replication_slots[r[0]] = value
             self._replication_slots = replication_slots
             self._schedule_load_slots = False
-            if self._force_readiness_check:
-                self._logical_slots_processing_queue = {n: None for n, v in replication_slots.items()
-                                                        if v['type'] == 'logical'}
-                self._force_readiness_check = False
 
     def ignore_replication_slot(self, cluster: Cluster, name: str) -> bool:
         """Check if slot *name* should not be managed by Patroni.
@@ -343,14 +442,25 @@ class SlotsHandler:
         active, dropped = self.drop_replication_slot(name)
         if dropped:
             logger.info("Dropped replication slot '%s'", name)
-            if name in self._replication_slots:
-                del self._replication_slots[name]
+            self._replication_slots.pop(name, None)
+            self._logical_slots_processing_queue.pop(name, None)
         else:
             self._schedule_load_slots = True
             if active:
                 logger.warning("Unable to drop replication slot '%s', slot is active", name)
             else:
                 logger.error("Failed to drop replication slot '%s'", name)
+
+    def _drop_incorrect_failover_synced_slots(self) -> None:
+        """Drop logical failover slots with synced=false on standby.
+
+        Try to workaround nasty bug in Postgres when it refuses to sync logical
+        failover slots after switchover on the former primary node.
+        """
+        for name, value in list(self._replication_slots.items()):
+            if value['type'] == 'logical' and value['failover'] and not value['synced']:
+                logger.info("Trying to drop logical replication slot '%s' with failover=true and synced=false", name)
+                self._drop_replication_slot(name)
 
     def _drop_incorrect_slots(self, cluster: Cluster, slots: Dict[str, Any]) -> None:
         """Compare required slots and configured as permanent slots with those found, dropping extraneous ones.
@@ -360,14 +470,28 @@ class SlotsHandler:
             Slots can be filtered out with ``ignore_slots`` configuration.
 
             Slots that have matching names but do not match attributes in *slots* will also be dropped.
+            Slots that are presented in *slots* but have wal_status=lost are also dropped.
 
         :param cluster: cluster state information object.
         :param slots: dictionary of desired slot names as keys with slot attributes as a dictionary value, if known.
         """
         # drop old replication slots which are not presented in desired slots.
-        for name in set(self._replication_slots) - set(slots):
+        for name, value in list(self._replication_slots.items()):
+            # However, take into account that it could be a logical failover slot, and we have to skip it.
+            if self._postgresql.major_version >= 170000 and value['type'] == 'logical' and value['failover']:
+                continue
+
+            wal_status_lost = name in slots and \
+                self._postgresql.major_version >= 130000 and value['wal_status'] == 'lost'
+
+            if name in slots and not wal_status_lost:
+                continue
+
             if not global_config.is_paused and not self.ignore_replication_slot(cluster, name):
-                logger.info("Trying to drop unknown replication slot '%s'", name)
+                if wal_status_lost:
+                    logger.info("Trying to drop replication slot '%s' with wal_status=lost", name)
+                else:
+                    logger.info("Trying to drop unknown replication slot '%s'", name)
                 self._drop_replication_slot(name)
 
         # drop slots with matching names but attributes that do not match, e.g. `plugin` or `database`.
@@ -403,7 +527,7 @@ class SlotsHandler:
             # change, which would prevent Postgres from advancing the xmin horizon.
             if self._postgresql.can_advance_slots and name in self._replication_slots and\
                     self._replication_slots[name]['type'] == 'physical':
-                self._copy_items(self._replication_slots[name], value, ('restart_lsn', 'xmin'))
+                self.copy_slot_items(self._replication_slots[name], value, is_logical=False)
                 if clean_inactive_physical_slots and value.get('expected_active') is False and value['xmin']:
                     logger.warning('Dropping physical replication slot %s because of its xmin value %s',
                                    name, value['xmin'])
@@ -441,7 +565,7 @@ class SlotsHandler:
                         logger.error("Error while advancing replication slot %s to position '%s': %r", name, lsn, exc)
 
     @contextmanager
-    def get_local_connection_cursor(self, **kwargs: Any) -> Iterator[Union['cursor', 'Cursor[Any]']]:
+    def get_local_connection_cursor(self, **kwargs: Any) -> Generator[Union['cursor', 'Cursor[Any]'], None, None]:
         """Create a new database connection to local server.
 
         Create a non-blocking connection cursor to avoid the situation where an execution of the query of
@@ -472,7 +596,7 @@ class SlotsHandler:
         for name, value in slots.items():
             if value['type'] == 'logical':
                 if self._replication_slots.get(name, {}).get('datoid'):
-                    self._copy_items(self._replication_slots[name], value)
+                    self.copy_slot_items(self._replication_slots[name], value)
                 else:
                     logical_slots[value['database']][name] = value
 
@@ -490,17 +614,6 @@ class SlotsHandler:
                                      name, value['plugin'], e)
                         slots.pop(name)
                     self._schedule_load_slots = True
-
-    def schedule_advance_slots(self, slots: Dict[str, Dict[str, int]]) -> Tuple[bool, List[str]]:
-        """Wrapper to ensure slots advance daemon thread is started if not already.
-
-        :param slots: dictionary containing slot information.
-
-        :return: tuple with the result of the scheduling of slot advancement: ``failed`` and list of slots to copy.
-        """
-        if not self._advance:
-            self._advance = SlotsAdvanceThread(self)
-        return self._advance.schedule(slots)
 
     def _ensure_logical_slots_replica(self, slots: Dict[str, Any]) -> List[str]:
         """Update logical *slots* on replicas.
@@ -527,7 +640,7 @@ class SlotsHandler:
 
             # If the logical already exists, copy some information about it into the original structure
             if name in self._replication_slots and compare_slots(value, self._replication_slots[name]):
-                self._copy_items(self._replication_slots[name], value)
+                self.copy_slot_items(self._replication_slots[name], value)
 
                 # The slot has feedback in DCS
                 if 'lsn' in value:
@@ -545,7 +658,7 @@ class SlotsHandler:
         for name in create_slots:
             slots.pop(name)
 
-        error, copy_slots = self.schedule_advance_slots(advance_slots)
+        error, copy_slots = self._advance.schedule(advance_slots)
         if error:
             self._schedule_load_slots = True
         return create_slots + copy_slots
@@ -569,7 +682,20 @@ class SlotsHandler:
             try:
                 self.load_replication_slots()
 
+                # Workaround for broken logical failover synced slots after switchover.
+                # We have to drop slots with failover=true, synced=false on former primary.
+                if self._postgresql.major_version >= 170000 and not self._postgresql.is_primary() and \
+                        not cluster.is_unlocked() and (cluster.leader and cluster.leader.name != self._postgresql.name):
+                    self._drop_incorrect_failover_synced_slots()
+
                 slots = cluster.get_replication_slots(self._postgresql, tags, show_error=True)
+
+                if self._force_readiness_check:
+                    self._logical_slots_processing_queue = {
+                        n: None for n, v in self._replication_slots.items()
+                        if v['type'] == 'logical' and not self.ignore_replication_slot(cluster, n)
+                        and (self._postgresql.major_version < 170000 or not v['failover'])}
+                    self._force_readiness_check = False
 
                 self._drop_incorrect_slots(cluster, slots)
 
@@ -594,12 +720,11 @@ class SlotsHandler:
         return ret
 
     @contextmanager
-    def _get_leader_connection_cursor(self, leader: Leader) -> Iterator[Union['cursor', 'Cursor[Any]']]:
+    def _get_leader_connection_cursor(self, leader: Leader) -> Generator[Union['cursor', 'Cursor[Any]'], None, None]:
         """Create a new database connection to the leader.
 
         .. note::
             Uses rewind user credentials because it has enough permissions to read files from PGDATA.
-            Sets the options ``connect_timeout`` to ``3`` and ``statement_timeout`` to ``2000``.
 
         :param leader: object with information on the leader
 
@@ -607,7 +732,7 @@ class SlotsHandler:
         """
         conn_kwargs = leader.conn_kwargs(self._postgresql.config.rewind_credentials)
         conn_kwargs['dbname'] = self._postgresql.database
-        with get_connection_cursor(connect_timeout=3, options="-c statement_timeout=2000", **conn_kwargs) as cur:
+        with get_connection_cursor(**conn_kwargs) as cur:
             yield cur
 
     def check_logical_slots_readiness(self, cluster: Cluster, tags: Tags) -> bool:

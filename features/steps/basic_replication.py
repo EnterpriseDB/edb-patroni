@@ -58,9 +58,8 @@ def kill_postgres(context, name):
     return context.pctl.stop(name, kill=True, postgres=True)
 
 
-def get_wal_name(context, pg_name):
-    version = context.pctl.query(pg_name, "SHOW server_version_num").fetchone()[0]
-    return 'xlog' if int(version) / 10000 < 10 else 'wal'
+def get_wal_name(context):
+    return 'xlog' if context.pctl.server_version / 10000 < 10 else 'wal'
 
 
 @step('I add the table {table_name:w} to {pg_name:name}')
@@ -68,7 +67,7 @@ def add_table(context, table_name, pg_name):
     # parse the configuration file and get the port
     try:
         context.pctl.query(pg_name, "CREATE TABLE public.{0}()".format(table_name))
-        context.pctl.query(pg_name, "SELECT pg_switch_{0}()".format(get_wal_name(context, pg_name)))
+        context.pctl.query(pg_name, "SELECT pg_switch_{0}()".format(get_wal_name(context)))
     except pg.Error as e:
         assert False, "Error creating table {0} on {1}: {2}".format(table_name, pg_name, e)
 
@@ -77,7 +76,7 @@ def add_table(context, table_name, pg_name):
 def toggle_wal_replay(context, action, pg_name):
     # pause or resume the wal replay process
     try:
-        context.pctl.query(pg_name, "SELECT pg_{0}_replay_{1}()".format(get_wal_name(context, pg_name), action))
+        context.pctl.query(pg_name, "SELECT pg_{0}_replay_{1}()".format(get_wal_name(context), action))
     except pg.Error as e:
         assert False, "Error during {0} wal recovery on {1}: {2}".format(action, pg_name, e)
 
@@ -128,6 +127,25 @@ def replication_works(context, primary, replica, time_limit):
         When I add the table test_{0} to {1}
         Then table test_{0} is present on {2} after {3} seconds
     """.format(str(time()).replace('.', '_').replace(',', '_'), primary, replica, time_limit))
+
+
+@then('{name1:name} and {name2:name} have the same wal position after {timeout:d} seconds')
+def wal_positions_are_equal(context, name1, name2, timeout):
+    timeout *= context.timeout_multiplier
+    wal_name = get_wal_name(context)
+    lsn_func = 'pg_last_{0}_replay_{1}()'.format(wal_name, 'lsn' if wal_name == 'wal' else 'location')
+    for _ in range(int(timeout)):
+        lsn1 = context.pctl.query(name1, "SELECT {0}".format(lsn_func), fail_ok=True)
+        lsn2 = context.pctl.query(name2, "SELECT {0}".format(lsn_func), fail_ok=True)
+        if lsn1 is not None and lsn2 is not None:
+            row1 = lsn1.fetchone()
+            row2 = lsn2.fetchone()
+            if row1 and row2 and row1[0] == row2[0]:
+                break
+        sleep(1)
+    else:
+        assert False, \
+            "{0} and {1} do not have the same wal position after {2} seconds".format(name1, name2, timeout)
 
 
 @step('there is one of {message_list} {level:w} in the {node} patroni log after {timeout:d} seconds')

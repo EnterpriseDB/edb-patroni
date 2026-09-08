@@ -1,20 +1,10 @@
-from unittest.mock import Mock, mock_open, patch, PropertyMock
+from unittest.mock import call, Mock, mock_open, patch, PropertyMock
 
 from patroni.postgresql import Postgresql
 from patroni.postgresql.cancellable import CancellableSubprocess
 from patroni.postgresql.rewind import Rewind
 
 from . import BaseTestPostgresql, MockCursor, psycopg_connect
-
-
-class MockThread(object):
-
-    def __init__(self, target, args):
-        self._target = target
-        self._args = args
-
-    def start(self):
-        self._target(*self._args)
 
 
 def mock_cancellable_call(*args, **kwargs):
@@ -63,6 +53,42 @@ class TestRewind(BaseTestPostgresql):
         self.p.config._config['use_pg_rewind'] = False
         self.assertFalse(self.r.can_rewind)
 
+    def test_can_rewind_logs_reason(self):
+        with patch('patroni.postgresql.rewind.logger.debug') as mock_debug:
+            self.p.config._config['use_pg_rewind'] = False
+            self.r.can_rewind
+            mock_debug.assert_called_with('pg_rewind is not possible: use_pg_rewind is not enabled'
+                                          ' in Patroni configuration')
+
+        self.p.config._config['use_pg_rewind'] = True
+        with patch('subprocess.call', Mock(return_value=1)), \
+                patch('patroni.postgresql.rewind.logger.debug') as mock_debug:
+            self.r.can_rewind
+            mock_debug.assert_called_with('pg_rewind is not possible: pg_rewind command returned'
+                                          ' non-zero exit code %s', 1)
+
+        with patch('subprocess.call', side_effect=OSError('No such file')), \
+                patch('patroni.postgresql.rewind.logger.debug') as mock_debug:
+            self.r.can_rewind
+            args = mock_debug.call_args[0]
+            self.assertEqual(args[0], 'pg_rewind is not possible: pg_rewind command is not accessible: %s')
+            self.assertIsInstance(args[1], OSError)
+
+        with patch.object(Postgresql, 'controldata',
+                          Mock(return_value={'wal_log_hints setting': 'off',
+                                             'Data page checksum version': '0'})), \
+                patch('patroni.postgresql.rewind.logger.debug') as mock_debug:
+            self.r.can_rewind
+            mock_debug.assert_called_with('pg_rewind is not possible: neither wal_log_hints nor data checksums'
+                                          ' are enabled (wal_log_hints=%s, data_checksums=%s)', 'off', '0')
+
+    def test_trigger_check_diverged_lsn_logs_when_blocked(self):
+        self.p.config._config['use_pg_rewind'] = False
+        with patch('patroni.postgresql.rewind.logger.debug') as mock_debug:
+            self.r.trigger_check_diverged_lsn()
+            mock_debug.assert_any_call('not checking diverged timeline: pg_rewind is not possible'
+                                       ' and remove_data_directory_on_diverged_timelines is not enabled')
+
     def test_pg_rewind(self):
         r = {'user': '', 'host': '', 'port': '', 'database': '', 'password': ''}
         with patch.object(Postgresql, 'major_version', PropertyMock(return_value=150000)), \
@@ -81,6 +107,132 @@ class TestRewind(BaseTestPostgresql):
             with patch.object(CancellableSubprocess, 'call', mock_cancellable_call1):
                 self.assertFalse(self.r.pg_rewind(r))
 
+    def test_pg_rewind_user_options(self):
+        """Test pg_rewind with custom user options."""
+        r = {'user': '', 'host': '', 'port': '', 'database': '', 'password': ''}
+
+        def mock_call_with_cmd_capture(self, cmd, *args, **kwargs):
+            # Capture the command that was called for verification
+            mock_call_with_cmd_capture.last_cmd = cmd
+            communicate = kwargs.pop('communicate', None)
+            if isinstance(communicate, dict):
+                communicate.update(stdout=b'', stderr=b'')
+            return 0
+
+        with patch.object(Postgresql, 'major_version', PropertyMock(return_value=150000)), \
+             patch('subprocess.check_output', Mock(return_value=b'foo %f %p %r %% % %')), \
+             patch.object(CancellableSubprocess, 'call', mock_call_with_cmd_capture):
+
+            # Test with valid user options as list of dicts
+            self.p.config._config['rewind'] = [{'sync-method': 'fsync'}, {'custom-option': 'custom-value'}]
+            self.assertTrue(self.r.pg_rewind(r))
+            # Verify user options were added to command
+            cmd = mock_call_with_cmd_capture.last_cmd
+            self.assertIn('--sync-method=fsync', cmd)
+            self.assertIn('--custom-option=custom-value', cmd)
+
+            # Test with valid user options as list of strings
+            self.p.config._config['rewind'] = ['debug', 'progress']
+            self.assertTrue(self.r.pg_rewind(r))
+            cmd = mock_call_with_cmd_capture.last_cmd
+            self.assertIn('--debug', cmd)
+            self.assertIn('--progress', cmd)
+
+            # Test with mix of valid options
+            self.p.config._config['rewind'] = ['debug', {'sync-method': 'fsync'}]
+            self.assertTrue(self.r.pg_rewind(r))
+            cmd = mock_call_with_cmd_capture.last_cmd
+            self.assertIn('--debug', cmd)
+            self.assertIn('--sync-method=fsync', cmd)
+
+            # Test that not allowed options are filtered out
+            with patch('patroni.postgresql.rewind.logger.error') as mock_error:
+                self.p.config._config['rewind'] = ['dry-run', 'debug']
+                self.assertTrue(self.r.pg_rewind(r))
+                # Verify error was logged for not allowed option
+                mock_error.assert_called_with('dry-run option for rewind is not allowed')
+                # Verify only allowed option is in command
+                cmd = mock_call_with_cmd_capture.last_cmd
+                self.assertNotIn('--dry-run', cmd)
+                self.assertIn('--debug', cmd)
+
+            # Test with empty options
+            self.p.config._config['rewind'] = []
+            self.assertTrue(self.r.pg_rewind(r))
+
+            # Test with no rewind options configured
+            if 'rewind' in self.p.config._config:
+                del self.p.config._config['rewind']
+            self.assertTrue(self.r.pg_rewind(r))
+
+    def test_pg_rewind_progress(self):
+        """Test that pg_rewind output is streamed to the log when --progress is among user options."""
+        r = {'user': '', 'host': '', 'port': '', 'database': '', 'password': ''}
+
+        def mock_call_with_stream_cb(self, cmd, *args, **kwargs):
+            mock_call_with_stream_cb.stream_cb = kwargs.pop('stream_cb', None)
+            communicate = kwargs.pop('communicate', None)
+            if isinstance(communicate, dict):
+                communicate.update(stdout=b'', stderr=b'')
+            return 0
+
+        with patch.object(Postgresql, 'major_version', PropertyMock(return_value=150000)), \
+                patch('subprocess.check_output', Mock(return_value=b'foo %f %p %r %% % %')), \
+                patch.object(CancellableSubprocess, 'call', mock_call_with_stream_cb):
+
+            self.p.config._config['rewind'] = ['progress']
+            with patch('patroni.postgresql.rewind.logger.info') as mock_info:
+                self.assertTrue(self.r.pg_rewind(r))
+                # the stdout/stderr summary is not logged, the output has already been streamed line by line
+                mock_info.assert_called_with('pg_rewind exit code=%s', 0)
+                self.assertEqual(mock_info.call_count, 2)
+            self.assertEqual(mock_call_with_stream_cb.stream_cb, Rewind._log_output_line)
+
+            del self.p.config._config['rewind']
+            with patch('patroni.postgresql.rewind.logger.info') as mock_info:
+                self.assertTrue(self.r.pg_rewind(r))
+                self.assertEqual(mock_info.call_args_list[-2:],
+                                 [call(' stdout=%s', ''), call(' stderr=%s', '')])
+            self.assertIsNone(mock_call_with_stream_cb.stream_cb)
+
+        with patch('patroni.postgresql.rewind.logger.info') as mock_info:
+            Rewind._log_output_line('stderr', b'271/271 MB (100%) copied')
+            mock_info.assert_called_once_with('pg_rewind: %s', '271/271 MB (100%) copied')
+
+        with patch('patroni.postgresql.rewind.logger.info') as mock_info:
+            # pg_rewind writes empty lines, they must not pollute the log
+            Rewind._log_output_line('stdout', b'')
+            mock_info.assert_not_called()
+
+        with patch('patroni.postgresql.rewind.logger.info') as mock_info:
+            # the output is produced in the user's locale and must never break the callback
+            Rewind._log_output_line('stderr', b'pg_rewind: \xff')
+            mock_info.assert_called_once_with('pg_rewind: %s', 'pg_rewind: \ufffd')
+
+        def mock_call_missing_wal(self, cmd, *args, **kwargs):
+            mock_call_missing_wal.stream_cb = kwargs.pop('stream_cb', None)
+            communicate = kwargs.pop('communicate', None)
+            if isinstance(communicate, dict):
+                communicate.update(stdout=b'', stderr=b'')
+                communicate[mock_call_missing_wal.pipe] = \
+                    b'pg_rewind: error: could not open file ' \
+                    b'"data/postgresql0/pg_xlog/000000010000000000000003": No such file'
+            return 1
+
+        # On PostgreSQL < 15 the streamed output must remain available for the missing WAL detection,
+        # no matter whether pg_rewind reported the missing file on stderr or stdout
+        for pipe in ('stderr', 'stdout'):
+            mock_call_missing_wal.pipe = pipe
+            with patch.object(Postgresql, 'major_version', PropertyMock(return_value=120000)), \
+                    patch('subprocess.check_output', Mock(return_value=b'foo %f %p %r %% % %')), \
+                    patch.object(CancellableSubprocess, 'call', mock_call_missing_wal), \
+                    patch.object(Rewind, '_fetch_missing_wal', Mock(return_value=False)) as mock_fetch:
+                self.p.config._config['rewind'] = ['progress']
+                self.assertFalse(self.r.pg_rewind(r))
+                del self.p.config._config['rewind']
+                self.assertIsNotNone(mock_call_missing_wal.stream_cb)
+                mock_fetch.assert_called_once_with('foo %f %p %r %% % %', '000000010000000000000003')
+
     @patch.object(Rewind, 'can_rewind', PropertyMock(return_value=True))
     def test__get_local_timeline_lsn(self):
         self.r.trigger_check_diverged_lsn()
@@ -92,10 +244,22 @@ class TestRewind(BaseTestPostgresql):
             self.r.rewind_or_reinitialize_needed_and_possible(self.leader)
 
         with patch.object(Postgresql, 'is_running', Mock(return_value=True)), \
-                patch.object(MockCursor, 'fetchone', Mock(side_effect=Exception)), \
-                patch.object(MockCursor, 'fetchall',
-                             Mock(return_value=[(0, 0, 1, 1, 0, 0, 0, 0, 0, None, None, None)])):
-            self.r.rewind_or_reinitialize_needed_and_possible(self.leader)
+                patch.object(MockCursor, 'fetchone', Mock(side_effect=Exception)):
+            with patch.object(MockCursor, 'fetchall',
+                              Mock(return_value=[(0, 0, 1, 1, 0, 0, 0, 0, 0, None, None, None)])):
+                self.r.rewind_or_reinitialize_needed_and_possible(self.leader)
+
+            self.p.reset_cluster_info_state(None)
+            with patch.object(MockCursor, 'fetchall', Mock(side_effect=Exception)):
+                self.r.rewind_or_reinitialize_needed_and_possible(self.leader)
+
+                with patch.object(Postgresql, 'controldata',
+                                  Mock(return_value={'Database cluster state': 'in archive recovery',
+                                                     'Minimum recovery ending location': '0/1',
+                                                     "Min recovery ending loc's timeline": '1',
+                                                     'Latest checkpoint location': '0/1'})), \
+                        patch.object(Postgresql, 'is_starting', Mock(return_value=True)):
+                    self.r.rewind_or_reinitialize_needed_and_possible(self.leader)
 
     @patch.object(CancellableSubprocess, 'call', mock_cancellable_call)
     @patch.object(Postgresql, 'get_guc_value', Mock(return_value=''))
@@ -187,7 +351,7 @@ class TestRewind(BaseTestPostgresql):
 
             mock_popen.return_value.communicate.return_value = (
                 b'0, lsn: 0/040159C1, prev 0/\n',
-                b'pg_waldump: fatal: error in WAL record at 0/40159C1: invalid record '
+                b'pg_waldump: fatal: error in WAL record at 0/040159C1: invalid record '
                 b'length at 0/402DD98: expected at least 24, got 0\n'
             )
             self.r.reset_state()
@@ -322,11 +486,13 @@ class TestRewind(BaseTestPostgresql):
     def test_ensure_clean_shutdown(self):
         self.assertIsNone(self.r.ensure_clean_shutdown())
 
-    @patch('patroni.postgresql.rewind.Thread', MockThread)
+    @patch('patroni.thread_pool.get_executor')
     @patch.object(Postgresql, 'controldata')
     @patch.object(Postgresql, 'checkpoint')
     @patch.object(Postgresql, 'get_primary_timeline')
-    def test_ensure_checkpoint_after_promote(self, mock_get_primary_timeline, mock_checkpoint, mock_controldata):
+    def test_ensure_checkpoint_after_promote(self, mock_get_primary_timeline,
+                                             mock_checkpoint, mock_controldata, mock_executor):
+        mock_executor.return_value.submit = lambda f, p1, p2: f(p1, p2)
         mock_controldata.return_value = {"Latest checkpoint's TimeLineID": 1}
         mock_get_primary_timeline.return_value = 1
         self.r.ensure_checkpoint_after_promote(Mock())

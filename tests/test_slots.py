@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch, PropertyMock
 from patroni import global_config, psycopg
 from patroni.dcs import Cluster, ClusterConfig, Member, Status, SyncState
 from patroni.postgresql import Postgresql
+from patroni.postgresql.config import ConfigHandler
 from patroni.postgresql.misc import fsync_dir, PostgresqlRole, PostgresqlState
 from patroni.postgresql.slots import SlotsAdvanceThread, SlotsHandler
 from patroni.tags import Tags
@@ -24,21 +25,22 @@ class TestTags(Tags):
 
 @patch('subprocess.call', Mock(return_value=0))
 @patch('patroni.psycopg.connect', psycopg_connect)
-@patch.object(Thread, 'start', Mock())
 @patch.object(Postgresql, 'is_running', Mock(return_value=True))
 class TestSlotsHandler(BaseTestPostgresql):
 
     @patch('subprocess.call', Mock(return_value=0))
+    @patch('subprocess.check_output', Mock(return_value=b'postgres (PostgreSQL) 19.0'))
     @patch('os.rename', Mock())
     @patch('patroni.postgresql.CallbackExecutor', Mock())
-    @patch.object(Postgresql, 'get_major_version', Mock(return_value=130000))
+    @patch.object(Thread, 'start', Mock())
+    @patch.object(Postgresql, 'get_major_version', Mock(return_value=170000))
     @patch.object(Postgresql, 'is_running', Mock(return_value=True))
     def setUp(self):
         super(TestSlotsHandler, self).setUp()
         self.s = self.p.slots_handler
         self.p.start()
         config = ClusterConfig(1, {'slots': {'ls': {'database': 'a', 'plugin': 'b'}, 'ls2': None}}, 1)
-        self.cluster = Cluster(True, config, self.leader, Status(0, {'ls': 12345, 'ls2': 12345}, []),
+        self.cluster = Cluster(True, config, self.leader, Status(0, {'ls': 12345, 'ls2': 12345}, [], None),
                                [self.me, self.other, self.leadermem], None, SyncState.empty(), None, None)
         global_config.update(self.cluster)
         self.tags = TestTags()
@@ -47,7 +49,7 @@ class TestSlotsHandler(BaseTestPostgresql):
         config = ClusterConfig(1, {'slots': {'test_3': {'database': 'a', 'plugin': 'b'},
                                              'A': 0, 'ls': 0, 'b': {'type': 'logical', 'plugin': '1'}},
                                    'ignore_slots': [{'name': 'blabla'}]}, 1)
-        cluster = Cluster(True, config, self.leader, Status(0, {'test_3': 10}, []),
+        cluster = Cluster(True, config, self.leader, Status(0, {'test_3': 10}, [], None),
                           [self.me, self.other, self.leadermem], None, SyncState.empty(), None, None)
         global_config.update(cluster)
         with mock.patch('patroni.postgresql.Postgresql._query', Mock(side_effect=psycopg.OperationalError)):
@@ -83,6 +85,25 @@ class TestSlotsHandler(BaseTestPostgresql):
                 self.p.set_role(PostgresqlRole.REPLICA)
                 self.s.sync_replication_slots(cluster, self.tags)
 
+        config = ClusterConfig(1, {'slots': {'ls': {'type': 'logical', 'plugin': 'b', 'database': 'a'}}}, 1)
+        cluster = Cluster(True, config, self.leader,
+                          Status(0, {'test_3': 10}, [], None),
+                          [self.me, self.other, self.leadermem], None, SyncState.empty(), None, None)
+        global_config.update(cluster)
+        with patch.object(Postgresql, 'is_primary', Mock(side_effect=[False, True])):
+            # as replica
+            self.s.sync_replication_slots(cluster, self.tags)
+            self.assertIn('ls', self.s._replication_slots)
+            self.assertEqual(self.s._replication_slots['ls'],
+                             {'type': 'logical', 'plugin': 'b', 'database': 'a', 'datoid': 5, 'catalog_xmin': 100,
+                              'confirmed_flush_lsn': 500, 'failover': False, 'synced': False, 'wal_status': 'reserved'})
+            # as primary
+            self.s.sync_replication_slots(cluster, self.tags)
+            self.assertIn('ls', self.s._replication_slots)
+            self.assertEqual(self.s._replication_slots['ls'],
+                             {'type': 'logical', 'plugin': 'b', 'database': 'a', 'datoid': 5, 'catalog_xmin': 100,
+                              'confirmed_flush_lsn': 500, 'failover': False, 'synced': False, 'wal_status': 'reserved'})
+
     def test_cascading_replica_sync_replication_slots(self):
         """Test sync with a cascading replica so physical slots are present on a replica."""
         config = ClusterConfig(1, {'slots': {'ls': {'database': 'a', 'plugin': 'b'}}}, 1)
@@ -90,7 +111,7 @@ class TestSlotsHandler(BaseTestPostgresql):
             'state': PostgresqlState.RUNNING, 'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5436/postgres',
             'tags': {'replicatefrom': 'postgresql0'}
         })
-        cluster = Cluster(True, config, self.leader, Status(0, {'ls': 10}, []),
+        cluster = Cluster(True, config, self.leader, Status(0, {'ls': 10}, [], None),
                           [self.me, self.other, self.leadermem, cascading_replica], None, SyncState.empty(), None, None)
         self.p.set_role(PostgresqlRole.REPLICA)
         with patch.object(Postgresql, '_query') as mock_query, \
@@ -112,16 +133,16 @@ class TestSlotsHandler(BaseTestPostgresql):
             mock_query.return_value = [(
                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None,
                 [{"slot_name": "ls", "type": "logical", "datoid": 5, "plugin": "b", "xmin": 105,
-                  "confirmed_flush_lsn": 12345, "catalog_xmin": 105, "restart_lsn": 12344},
+                  "confirmed_flush_lsn": 12345, "catalog_xmin": 105, "restart_lsn": 12344, 'wal_status': 'reserved'},
                  {"slot_name": "blabla", "type": "physical", "datoid": None, "plugin": None, "xmin": 105,
-                  "confirmed_flush_lsn": None, "catalog_xmin": 105, "restart_lsn": 12344}])]
+                  "confirmed_flush_lsn": None, "catalog_xmin": 105, "restart_lsn": 12344, 'wal_status': 'reserved'}])]
             self.assertEqual(self.p.slots(), {'ls': 12345, 'blabla': 12344, 'postgresql0': 0})
 
             self.p.reset_cluster_info_state(None)
             mock_query.return_value = [(
                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None,
                 [{"slot_name": "ls", "type": "logical", "datoid": 6, "plugin": "b", "xmin": 105,
-                  "confirmed_flush_lsn": 12345, "catalog_xmin": 105}])]
+                  "confirmed_flush_lsn": 12345, "catalog_xmin": 105, 'wal_status': 'reserved'}])]
             self.assertEqual(self.p.slots(), {'postgresql0': 0})
 
     def test_nostream_slot_processing(self):
@@ -141,7 +162,7 @@ class TestSlotsHandler(BaseTestPostgresql):
             'state': PostgresqlState.RUNNING, 'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5436/postgres',
             'xlog_location': 99})
         cluster = Cluster(
-            True, config, self.leader, Status(100, {'leader': 99, 'test_2': 98, 'test_3': 97, 'test_4': 98}, []),
+            True, config, self.leader, Status(100, {'leader': 99, 'test_2': 98, 'test_3': 97, 'test_4': 98}, [], None),
             [self.leadermem, nostream_node, cascade_node, stream_node], None, SyncState.empty(), None, None)
         global_config.update(cluster)
 
@@ -227,16 +248,16 @@ class TestSlotsHandler(BaseTestPostgresql):
             self.assertEqual(self.s.sync_replication_slots(self.cluster, self.tags), [])
 
         with patch.object(SlotsHandler, '_query', Mock(return_value=[('ls', 'logical', 1, 499, 'b',
-                                                                      'a', 5, 100, 500)])), \
+                                                                      'a', 5, 100, 500, 'reserved', False, False)])), \
                 patch.object(MockCursor, 'execute', Mock(side_effect=psycopg.OperationalError)), \
-                patch.object(SlotsAdvanceThread, 'schedule', Mock(return_value=(True, ['ls']))):
+                patch.object(SlotsAdvanceThread, 'schedule') as advance_mock:
+            advance_mock.return_value = (True, ['ls'])
             # copy invalidated slot
             with patch.object(psycopg.OperationalError, 'diag') as mock_diag:
                 type(mock_diag).sqlstate = PropertyMock(return_value='58P01')
                 self.assertEqual(self.s.sync_replication_slots(self.cluster, self.tags), ['ls'])
             # advance slots based on the replay lsn value
-            with patch.object(Postgresql, 'replay_lsn', Mock(side_effect=[200, 700, 900])), \
-                 patch.object(SlotsHandler, 'schedule_advance_slots') as advance_mock:
+            with patch.object(Postgresql, 'replay_lsn', Mock(side_effect=[200, 700, 900])):
                 self.s.sync_replication_slots(self.cluster, self.tags)
                 advance_mock.assert_called_with(dict())
                 self.s.sync_replication_slots(self.cluster, self.tags)
@@ -278,7 +299,7 @@ class TestSlotsHandler(BaseTestPostgresql):
     @patch.object(Postgresql, 'start', Mock(return_value=True))
     @patch.object(Postgresql, 'is_primary', Mock(return_value=False))
     def test_on_promote(self):
-        self.s.schedule_advance_slots({'foo': {'bar': 100}})
+        self.s._advance.schedule({'foo': {'bar': 100}})
         self.s.copy_logical_slots(self.cluster, self.tags, ['ls'])
         self.s.on_promote()
 
@@ -294,11 +315,11 @@ class TestSlotsHandler(BaseTestPostgresql):
                 patch.object(psycopg.OperationalError, 'diag') as mock_diag:
             for err in ('58P01', '55000'):
                 type(mock_diag).sqlstate = PropertyMock(return_value=err)
-                self.s.schedule_advance_slots({'foo': {'bar': 100}})
+                self.s._advance.schedule({'foo': {'bar': 100}})
                 self.s._advance.sync_slots()
                 self.assertEqual(self.s._advance._copy_slots, ["bar"])
                 # we don't want to make attempts to advance slots that are to be copied
-                self.s.schedule_advance_slots({'foo': {'bar': 101}})
+                self.s._advance.schedule({'foo': {'bar': 101}})
                 self.assertEqual(self.s._advance._scheduled, {})
                 self.s._advance.clean()
 
@@ -307,20 +328,21 @@ class TestSlotsHandler(BaseTestPostgresql):
             self.assertRaises(Exception, self.s._advance.run)
 
         with patch.object(SlotsHandler, 'get_local_connection_cursor', Mock(side_effect=Exception)):
-            self.s.schedule_advance_slots({'foo': {'bar': 100}})
+            self.s._advance.schedule({'foo': {'bar': 100}})
             self.s._advance.sync_slots()
 
     def test_advance_physical_primary(self):
         self.p.name = self.me.name
         config = ClusterConfig(1, {'member_slots_ttl': 0, 'slots': {'test_1': {'type': 'physical'}}}, 1)
-        cluster = Cluster(True, config, self.leader, Status(0, {}, []),
+        cluster = Cluster(True, config, self.leader, Status(0, {}, [], None),
                           [self.me, self.other, self.leadermem], None, SyncState.empty(), None, None)
         self.other.data['xlog_location'] = 12346
         global_config.update(cluster)
 
         # Should advance permanent physical slot on the primary for a node that is cascading from the other node
-        with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('test_1', 'physical', None, 12345, None, None,
-                                                                      None, None, None)], Exception])) as mock_query, \
+        with patch.object(SlotsHandler, '_query',
+                          Mock(side_effect=[[('test_1', 'physical', None, 12345, None, None,
+                                              None, None, None, 'reserved')], Exception])) as mock_query, \
                 patch('patroni.postgresql.slots.logger.error') as mock_error:
             self.s.sync_replication_slots(cluster, self.tags)
             self.assertEqual(mock_query.call_args[0],
@@ -330,8 +352,9 @@ class TestSlotsHandler(BaseTestPostgresql):
 
         # Should drop permanent physical slot on the primary for a node
         # that is cascading from the other node if given slot has xmin set
-        with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('test_1', 'physical', 1, 12345, None, None,
-                                                                      None, None, None)], Exception])) as mock_query:
+        with patch.object(SlotsHandler, '_query',
+                          Mock(side_effect=[[('test_1', 'physical', 1, 12345, None, None,
+                                              None, None, None, 'reserved')], Exception])) as mock_query:
             self.s.sync_replication_slots(cluster, self.tags)
             self.assertTrue(mock_query.call_args[0][0].startswith('WITH slots AS (SELECT slot_name, active'))
 
@@ -339,13 +362,14 @@ class TestSlotsHandler(BaseTestPostgresql):
     @patch.object(Postgresql, 'role', PropertyMock(return_value=PostgresqlRole.REPLICA))
     def test_advance_physical_slots(self):
         config = ClusterConfig(1, {'slots': {'blabla': {'type': 'physical'}, 'leader': None}}, 1)
-        cluster = Cluster(True, config, self.leader, Status(0, {'blabla': 12346}, []),
+        cluster = Cluster(True, config, self.leader, Status(0, {'blabla': 12346}, [], None),
                           [self.me, self.other, self.leadermem], None, SyncState.empty(), None, None)
         global_config.update(cluster)
         self.s.sync_replication_slots(cluster, self.tags)
 
-        with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('blabla', 'physical', None, 12345, None, None,
-                                                                      None, None, None)], Exception])) as mock_query, \
+        with patch.object(SlotsHandler, '_query',
+                          Mock(side_effect=[[('blabla', 'physical', None, 12345, None, None,
+                                              None, None, None, 'reserved')], Exception])) as mock_query, \
                 patch('patroni.postgresql.slots.logger.error') as mock_error:
             self.s.sync_replication_slots(cluster, self.tags)
             self.assertEqual(mock_query.call_args[0],
@@ -354,12 +378,12 @@ class TestSlotsHandler(BaseTestPostgresql):
                              "Error while advancing replication slot %s to position '%s': %r")
 
         with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('test_1', 'physical', 1, 12345, None, None,
-                                                                      None, None, None)], Exception])), \
+                                                                      None, None, None, 'reserved')], Exception])), \
                 patch.object(SlotsHandler, '_drop_replication_slot', Mock(return_value=(True))):
             self.s.sync_replication_slots(cluster, self.tags)
 
         with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('test_1', 'physical', 1, 12345, None, None,
-                                                                      None, None, None)], Exception])), \
+                                                                      None, None, None, 'reserved')], Exception])), \
                 patch.object(SlotsHandler, 'drop_replication_slot', Mock(return_value=(True, False))), \
                 patch('patroni.postgresql.slots.logger.warning') as mock_warning:
             self.s.sync_replication_slots(cluster, self.tags)
@@ -367,12 +391,12 @@ class TestSlotsHandler(BaseTestPostgresql):
                              ("Unable to drop replication slot '%s', slot is active", 'test_1'))
 
         with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('test_1', 'physical', 1, 12345, None, None,
-                                                                      None, None, None)], Exception])), \
+                                                                      None, None, None, 'reserved')], Exception])), \
                 patch.object(SlotsHandler, '_drop_replication_slot', Mock(return_value=(False))):
             self.s.sync_replication_slots(cluster, self.tags)
 
         with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('test_1', 'physical', 1, 12345, None, None,
-                                                                      None, None, None)], Exception])), \
+                                                                      None, None, None, 'reserved')], Exception])), \
                 patch.object(Cluster, 'is_unlocked', Mock(return_value=True)), \
                 patch.object(SlotsHandler, '_drop_replication_slot') as mock_drop:
             self.s.sync_replication_slots(cluster, self.tags)
@@ -380,8 +404,9 @@ class TestSlotsHandler(BaseTestPostgresql):
 
         # If the slot has no restart_lsn, we should not try to advance it, and only warn the user that this is not an
         # expected situation.
-        with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('blabla', 'physical', None, None, None, None,
-                                                                      None, None, None)], Exception])) as mock_query, \
+        with patch.object(SlotsHandler, '_query',
+                          Mock(side_effect=[[('blabla', 'physical', None, None, None, None,
+                                              None, None, None, 'reserved')], Exception])) as mock_query, \
                 patch('patroni.postgresql.slots.logger.warning') as mock_warning, \
                 patch.object(SlotsHandler, '_drop_replication_slot') as mock_drop:
             self.s.sync_replication_slots(cluster, self.tags)
@@ -399,13 +424,14 @@ class TestSlotsHandler(BaseTestPostgresql):
     def test_slots_nofailover_tag(self):
         self.p.name = self.leadermem.name
         cluster = Cluster(True, ClusterConfig(1, {}, 1), self.leader,
-                          Status(0, {}, [self.leadermem.name, self.other.name, self.me.name]),
+                          Status(0, {}, [self.leadermem.name, self.other.name, self.me.name], None),
                           [self.me, self.other, self.leadermem], None, SyncState.empty(), None, None)
         global_config.update(cluster)
-        with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('test_1', 'physical', 1, 12345, None, None,
-                                                                      None, None, None)], Exception])) as mock_query:
+        with patch.object(SlotsHandler, '_query',
+                          Mock(side_effect=[[('test_1', 'physical', 1, 12345, None, None,
+                                              None, None, None, 'reserved')], Exception])) as mock_query:
             self.s.sync_replication_slots(cluster, self.tags)
-            self.assertTrue(mock_query.call_args[0][0].startswith('SELECT slot_name, slot_type, xmin, '))
+            self.assertTrue(mock_query.call_args[0][0].startswith('SELECT slot_name, slot_type AS type, xmin, '))
 
     def test__drop_replication_slot(self):
         """Test the :meth:~SlotsHandler._drop_replication_slot` method."""
@@ -453,3 +479,147 @@ class TestSlotsHandler(BaseTestPostgresql):
             mock_error.assert_called_once_with("Failed to drop replication slot '%s'", 'testslot')
             self.assertTrue(self.s._schedule_load_slots)
             self.assertIn('testslot', self.s._replication_slots)
+
+    @patch.object(Postgresql, 'is_primary', Mock(return_value=False))
+    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=170000))
+    @patch.object(Postgresql, '_query',
+                  Mock(return_value=[('ls', 'logical', 1, 104, 'b', 'a', 5, 12345, 105, 'reserved', True, False)]))
+    def test__drop_incorrect_failover_synced_slots(self):
+        config = ClusterConfig(1, {}, 1)
+        cluster = Cluster(True, config, self.leader, Status(0, {}, [], None),
+                          [self.me, self.other, self.leadermem], None, SyncState.empty(), None, None)
+        with patch('patroni.postgresql.slots.logger.info') as mock_info:
+            self.s.sync_replication_slots(cluster, self.tags)
+            self.assertEqual(mock_info.call_args_list[0][0],
+                             ("Trying to drop logical replication slot '%s' with failover=true and synced=false", 'ls'))
+
+    def test_update_synchronized_standby_slots(self):
+        """Test update_synchronized_standby_slots method."""
+        # Test: PostgreSQL version < 17 - should return False
+        with patch.object(Postgresql, 'major_version', 160000):
+            self.assertFalse(self.s.update_synchronized_standby_slots({'node1', 'node2'}))
+
+        # Test: Feature disabled - should return False
+        with patch.object(Postgresql, 'major_version', 170000), \
+             patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                          PropertyMock(return_value=False)):
+            self.assertFalse(self.s.update_synchronized_standby_slots({'node1', 'node2'}))
+
+        # Test: Feature enabled - empty members clears the parameter (no-op when already absent)
+        with patch.object(Postgresql, 'major_version', 170000), \
+             patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                          PropertyMock(return_value=True)):
+            self.assertFalse(self.s.update_synchronized_standby_slots(set()))
+            self.assertNotIn('synchronized_standby_slots', self.p.config._server_parameters)
+
+        # Test: Feature enabled - wildcard enables strict mode
+        with patch.object(Postgresql, 'major_version', 170000), \
+             patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                          PropertyMock(return_value=True)):
+            self.assertTrue(self.s.update_synchronized_standby_slots({'*'}))
+
+        # Test: Feature enabled - specific members sets the parameter
+        with patch.object(Postgresql, 'major_version', 170000), \
+             patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                          PropertyMock(return_value=True)):
+            self.assertTrue(self.s.update_synchronized_standby_slots({'node1', 'node2'}))
+            slots = self.p.config._server_parameters['synchronized_standby_slots']
+            self.assertIn('node1', slots)
+            self.assertIn('node2', slots)
+
+        # Test: Feature enabled with reload - should trigger reload
+        with patch.object(Postgresql, 'major_version', 170000), \
+             patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                          PropertyMock(return_value=True)), \
+             patch.object(Postgresql, 'state', PropertyMock(return_value=PostgresqlState.RUNNING)), \
+             patch.object(ConfigHandler, 'write_postgresql_conf', Mock()), \
+             patch.object(Postgresql, 'reload', Mock()) as mock_reload:
+            self.p.config._server_parameters.pop('synchronized_standby_slots', None)
+            self.assertTrue(self.s.update_synchronized_standby_slots({'node3'}, reload=True))
+            mock_reload.assert_called_once()
+
+        # Regression: member names with characters that require quoting (e.g. dashes) must
+        # be converted to valid slot names via slot_name_from_member_name and NOT contain
+        # any quote_standby_name artefacts (e.g. u0034 from encoded double quotes).
+        with patch.object(Postgresql, 'major_version', 170000), \
+             patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                          PropertyMock(return_value=True)):
+            self.p.config._server_parameters.pop('synchronized_standby_slots', None)
+            self.assertTrue(self.s.update_synchronized_standby_slots({'postgres-1', 'postgres-2'}))
+            slots = self.p.config._server_parameters['synchronized_standby_slots']
+            self.assertEqual(set(slots.split(',')), {'postgres_1', 'postgres_2'})
+            self.assertNotIn('u0034', slots)
+            self.assertNotIn('-', slots)
+
+        # Test: Feature toggled off - should restore the user-configured value regardless of
+        # which sync_members are passed in, and regardless of the calling code path (this is
+        # detected internally on every call, not just when a dedicated toggle check is made).
+        self.s._last_manage_sync_slots_enabled = True
+        with patch.object(Postgresql, 'major_version', 170000), \
+             patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                          PropertyMock(return_value=False)), \
+             patch.object(ConfigHandler, 'synchronized_standby_slots', PropertyMock(return_value='user_slot')):
+            self.assertTrue(self.s.update_synchronized_standby_slots({'node1'}))
+            self.assertEqual(self.p.config._server_parameters.get('synchronized_standby_slots'), 'user_slot')
+            self.assertFalse(self.s._last_manage_sync_slots_enabled)
+
+        # Test: Feature toggled off with no user-configured value - should clear the parameter
+        self.p.config._server_parameters['synchronized_standby_slots'] = 'stale_value'
+        self.s._last_manage_sync_slots_enabled = True
+        with patch.object(Postgresql, 'major_version', 170000), \
+             patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                          PropertyMock(return_value=False)), \
+             patch.object(ConfigHandler, 'synchronized_standby_slots', PropertyMock(return_value=None)):
+            self.assertTrue(self.s.update_synchronized_standby_slots(set()))
+            self.assertNotIn('synchronized_standby_slots', self.p.config._server_parameters)
+
+        # Test: synchronous_mode_strict - empty members with num >= 1 sets the strict placeholder,
+        # mirroring the behaviour of synchronous_standby_names.
+        self.s._last_manage_sync_slots_enabled = True
+        with patch.object(Postgresql, 'major_version', 170000), \
+             patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                          PropertyMock(return_value=True)):
+            self.p.config._server_parameters.pop('synchronized_standby_slots', None)
+            self.assertTrue(self.s.update_synchronized_standby_slots(set(), num=1))
+            self.assertEqual(self.p.config._server_parameters.get('synchronized_standby_slots'),
+                             '__patroni_strict_sync_replica_placeholder__')
+
+    def test_handle_manage_sync_slots_toggle(self):
+        """Test the dedicated toggle handler used by the "no-op" Ha call paths."""
+        # PostgreSQL < 17 - should be a no-op
+        with patch.object(Postgresql, 'major_version', 160000), \
+                patch.object(SlotsHandler, 'update_synchronized_standby_slots') as mock_update:
+            self.s.handle_manage_sync_slots_toggle({'node1'})
+            mock_update.assert_not_called()
+
+        # Feature state unchanged since last seen - should not touch the slots
+        self.s._last_manage_sync_slots_enabled = True
+        with patch.object(Postgresql, 'major_version', 170000), \
+                patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                             PropertyMock(return_value=True)), \
+                patch.object(SlotsHandler, 'update_synchronized_standby_slots') as mock_update:
+            self.s.handle_manage_sync_slots_toggle({'node1'})
+            mock_update.assert_not_called()
+
+        # Feature state toggled - should forward the update (including num) with reload=True
+        self.s._last_manage_sync_slots_enabled = False
+        with patch.object(Postgresql, 'major_version', 170000), \
+                patch.object(global_config.__class__, 'manage_synchronized_standby_slots_enabled',
+                             PropertyMock(return_value=True)), \
+                patch.object(SlotsHandler, 'update_synchronized_standby_slots') as mock_update:
+            self.s.handle_manage_sync_slots_toggle({'node1'}, num=1)
+            mock_update.assert_called_once_with({'node1'}, num=1, reload=True)
+
+    @patch.object(Postgresql, 'is_primary', Mock(return_value=False))
+    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=170000))
+    @patch.object(Postgresql, '_query',
+                  Mock(return_value=[('ls', 'logical', 1, 104, 'b', 'a', 5, 12345, 105, 'reserved', True, True),
+                                     ('test_1', 'physical', 1, 12345, None, None, None, None, None, 'lost')]))
+    def test__drop_incorrect_slots(self):
+        config = ClusterConfig(1, {}, 1)
+        cluster = Cluster(True, config, self.leader, Status(0, {}, [], None),
+                          [self.me, self.other, self.leadermem], None, SyncState.empty(), None, None)
+        with patch('patroni.postgresql.slots.logger.info') as mock_info:
+            self.s.sync_replication_slots(cluster, self.tags)
+            self.assertEqual(mock_info.call_args_list[0][0],
+                             ("Trying to drop replication slot '%s' with wal_status=lost", 'test_1'))

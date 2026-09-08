@@ -8,9 +8,13 @@ It is possible to override some of the configuration parameters defined in the P
 Global/Universal
 ----------------
 -  **PATRONI\_CONFIGURATION**: it is possible to set the entire configuration for the Patroni via ``PATRONI_CONFIGURATION`` environment variable. In this case any other environment variables will not be considered!
--  **PATRONI\_NAME**: name of the node where the current instance of Patroni is running. Must be unique for the cluster.
+-  **PATRONI\_THREAD\_POOL\_SIZE**: size of thread pool used by Patroni to execute asynchronous tasks and communicate via REST API with other members during leader race or failsafe checks. Minimal value is ``5``, default value is ``5``.
+-  **PATRONI\_THREAD\_STACK\_SIZE**: specifies the stack size to be used for threads started by Patroni. Value must be aligned by ``64kB``. Minimal value is ``64kB``,  default value (set by Patroni) is ``512kB``.
+-  **PATRONI\_NAME**: name of the node where the current instance of Patroni is running. Must be unique for the cluster. The value ``__patroni_strict_sync_replica_placeholder__`` is reserved for internal use by Patroni and cannot be used as a node name.
 -  **PATRONI\_NAMESPACE**: path within the configuration store where Patroni will keep information about the cluster. Default value: "/service"
 -  **PATRONI\_SCOPE**: cluster name
+-  **PATRONI\_SITE**: optional string name of the physical site or location where this Patroni node runs, such as a data center, availability zone, or region. When configured, Patroni records it in member metadata and uses it to prefer local automatic failover to the site where the last known leader is located, while also helping to prefer local clone sources for replica bootstrap and ``patronictl reinit``.
+-  **PG\_MALLOC\_ARENA\_MAX**: custom value for ``MALLOC_ARENA_MAX`` environment variable for  ``postmaster`` process. If not set, ``postmaster`` will inherit ``MALLOC_ARENA_MAX`` value.
 
 Log
 ---
@@ -97,7 +101,7 @@ ZooKeeper
 -  **PATRONI\_ZOOKEEPER\_KEY**: (optional) File with the client key.
 -  **PATRONI\_ZOOKEEPER\_KEY\_PASSWORD**: (optional) The client key password.
 -  **PATRONI\_ZOOKEEPER\_VERIFY**: (optional) Whether to verify certificate or not. Defaults to ``true``.
--  **PATRONI\_ZOOKEEPER\_SET\_ACLS**: (optional) If set, configure Kazoo to apply a default ACL to each ZNode that it creates. ACLs will assume 'x509' schema and should be specified as a dictionary with the principal as the key and one or more permissions as a list in the value.  Permissions may be one of ``CREATE``, ``READ``, ``WRITE``, ``DELETE`` or ``ADMIN``.  For example, ``set_acls: {CN=principal1: [CREATE, READ], CN=principal2: [ALL]}``.
+-  **PATRONI\_ZOOKEEPER\_SET\_ACLS**: (optional) If set, configures Kazoo to apply a default ACL to each ZNode that it creates. ACLs can use either the `x509` schema (default) or other supported ZooKeeper schemes such as `digest`. They should be specified as a dictionary where the key is the full principal (optionally prefixed with the scheme) and the value is a list of permissions. Permissions may be one or more of ``CREATE``, ``READ``, ``WRITE``, ``DELETE``, ``ADMIN``, or ``ALL``. For example, ``set_acls: {CN=principal1: [CREATE, READ], digest:principal2:+pjROuBuuwNNSujKyH8dGcEnFPQ=: [ALL]}``.
 -  **PATRONI\_ZOOKEEPER\_AUTH\_DATA**: (optional) Authentication credentials to use for the connection. Should be a dictionary in the form that `scheme` is the key and `credential` is the value. Defaults to empty dictionary.
 
 .. note::
@@ -137,6 +141,15 @@ Raft (deprecated)
 -  **PATRONI\_RAFT\_PARTNER\_ADDRS**: list of other Patroni nodes in the cluster in format ``"'ip1:port1','ip2:port2'"``. It is important to quote every single entity!
 -  **PATRONI\_RAFT\_DATA\_DIR**: directory where to store Raft log and snapshot. If not specified the current working directory is used.
 -  **PATRONI\_RAFT\_PASSWORD**: (optional) Encrypt Raft traffic with a specified password, requires ``cryptography`` python module.
+-  **PATRONI\_RAFT\_MIN\_TIMEOUT**: (optional) minimum election timeout in seconds for the underlying pysyncobj Raft implementation. Must be greater than 3 \* ``PATRONI_RAFT_APPEND_ENTRIES_PERIOD``. Default: ``0.4``.
+-  **PATRONI\_RAFT\_MAX\_TIMEOUT**: (optional) maximum election timeout in seconds for the underlying pysyncobj Raft implementation. Must be greater than ``PATRONI_RAFT_MIN_TIMEOUT``. Default: ``1.4``.
+-  **PATRONI\_RAFT\_CONNECTION\_TIMEOUT**: (optional) time in seconds after which a connection with no data received is considered dead. Must be greater than or equal to ``PATRONI_RAFT_MAX_TIMEOUT``. Default: ``3.5``.
+-  **PATRONI\_RAFT\_APPEND\_ENTRIES\_PERIOD**: (optional) interval in seconds for sending heartbeat commands. Must be less than one-third of ``PATRONI_RAFT_MIN_TIMEOUT``. Default: ``0.1``.
+-  **PATRONI\_RAFT\_CONNECTION\_RETRY\_TIME**: (optional) interval in seconds between reconnection attempts to offline nodes. Default: ``5.0``.
+-  **PATRONI\_RAFT\_LEADER\_FALLBACK\_TIMEOUT**: (optional) time in seconds after which a leader with no response from the majority falls back to follower state. Must be greater than ``PATRONI_RAFT_APPEND_ENTRIES_PERIOD``. Default: ``30.0``.
+
+.. note::
+   Patroni validates these constraints at startup and will refuse to start if they are violated. These values cannot be changed at runtime and require a restart. See :ref:`raft_settings` for details, including the high-latency limitation.
 
 PostgreSQL
 ----------
@@ -193,6 +206,7 @@ PostgreSQL
 
 REST API
 --------
+-  **PATRONI\_RESTAPI\_THREAD\_POOL\_SIZE**: size of thread pool used by Patroni to process REST API requests. Minimal value is ``5``, default value is ``5``.
 -  **PATRONI\_RESTAPI\_CONNECT\_ADDRESS**: IP address and port to access the REST API.
 -  **PATRONI\_RESTAPI\_LISTEN**: IP address and port that Patroni will listen to, to provide health-check information for HAProxy.
 -  **PATRONI\_RESTAPI\_USERNAME**: Basic-auth username to protect unsafe REST API endpoints.
@@ -208,6 +222,8 @@ REST API
 -  **PATRONI\_RESTAPI\_HTTP\_EXTRA\_HEADERS**: (optional) HTTP headers let the REST API server pass additional information with an HTTP response.
 -  **PATRONI\_RESTAPI\_HTTPS\_EXTRA\_HEADERS**: (optional) HTTPS headers let the REST API server pass additional information with an HTTP response when TLS is enabled. This will also pass additional information set in ``http_extra_headers``.
 -  **PATRONI\_RESTAPI\_REQUEST\_QUEUE\_SIZE**: (optional): Sets request queue size for TCP socket used by Patroni REST API.  Once the queue is full, further requests get a "Connection denied" error. The default value is 5.
+-  **PATRONI\_RESTAPI\_HANDSHAKE\_TIMEOUT**: (optional): Maximum time in seconds a single client is given to complete the TLS handshake. Connections that do not complete it in time are closed. It only applies when ``PATRONI_RESTAPI_CERTFILE`` is set. The default value is 2.
+-  **PATRONI\_RESTAPI\_REQUEST\_TIMEOUT**: (optional): Maximum time in seconds a single client is given to send its request, and to read the response. Connections that stay silent for longer are closed. The default value is 5.
 -  **PATRONI\_RESTAPI\_SERVER\_TOKENS**: (optional) Configures the value of the ``Server`` HTTP header.  ``Original`` (default) will expose the original behaviour and display the BaseHTTP and Python versions, e.g. ``BaseHTTP/0.6 Python/3.12.3``. ``Minimal``: The header will contain only the Patroni version, e.g. ``Patroni/4.0.0``. ``ProductOnly``: The header will contain only the product name, e.g. ``Patroni``.
 
 .. warning::

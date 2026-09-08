@@ -18,6 +18,7 @@ from patroni.async_executor import AsyncExecutor
 from patroni.dcs import Cluster, ClusterConfig, Member
 from patroni.dcs.etcd import AbstractEtcdClientWithFailover
 from patroni.exceptions import DCSError
+from patroni.log import PatroniLogger
 from patroni.postgresql import Postgresql
 from patroni.postgresql.config import ConfigHandler
 from patroni.postgresql.misc import PostgresqlRole, PostgresqlState
@@ -34,6 +35,12 @@ def mock_import(*args, **kwargs):
 
 
 def mock_import2(*args, **kwargs):
+    ret = Mock()
+    ret.__version__ = '2.8.3.dev1 a b c'
+    return ret
+
+
+def mock_import3(*args, **kwargs):
     if args[0] == 'psycopg2':
         raise ImportError
     ret = Mock()
@@ -76,6 +83,8 @@ class TestPatroni(unittest.TestCase):
     @patch('pkgutil.iter_importers', Mock(return_value=[MockFrozenImporter()]))
     @patch('urllib3.PoolManager.request', Mock(side_effect=Exception))
     @patch('sys.frozen', Mock(return_value=True), create=True)
+    @patch('patroni.api.PatroniThreadPoolExecutor', Mock())
+    @patch('patroni.thread_pool.PatroniThreadPoolExecutor', Mock())
     @patch.object(HTTPServer, '__init__', Mock())
     @patch.object(etcd.Client, 'read', etcd_read)
     @patch.object(Thread, 'start', Mock())
@@ -88,7 +97,7 @@ class TestPatroni(unittest.TestCase):
         RestApiServer.socket = 0
         os.environ['PATRONI_POSTGRESQL_DATA_DIR'] = 'data/test0'
         conf = config.Config('postgres0.yml')
-        self.p = Patroni(conf)
+        self.p = Patroni(conf, PatroniLogger())
 
     def tearDown(self):
         logging.getLogger().handlers[:] = self._handlers
@@ -111,19 +120,25 @@ class TestPatroni(unittest.TestCase):
 
     @patch('sys.argv', ['patroni.py', 'postgres0.yml'])
     @patch('time.sleep', Mock(side_effect=SleepException))
+    @patch('patroni.daemon.stack_size', Mock(side_effect=Exception))
     @patch.object(etcd.Client, 'delete', Mock())
     @patch.object(AbstractEtcdClientWithFailover, '_get_machines_list', Mock(return_value=['http://remotehost:2379']))
     @patch.object(Thread, 'join', Mock())
     @patch.object(Postgresql, '_get_gucs', Mock(return_value={'foo': True, 'bar': True}))
+    @patch.object(Postgresql, '_wait_for_connection_close', Mock())
     def test_patroni_patroni_main(self):
         with patch('subprocess.call', Mock(return_value=1)):
-            with patch.object(Patroni, 'run', Mock(side_effect=SleepException)):
-                os.environ['PATRONI_POSTGRESQL_DATA_DIR'] = 'data/test0'
+            with patch.object(Patroni, 'run', Mock(side_effect=SleepException)), \
+                patch('patroni.daemon.__systemd_available', False), \
+                patch.dict(os.environ, {'PATRONI_THREAD_STACK_SIZE': 'a',
+                                        'PATRONI_THREAD_POOL_SIZE': 'a',
+                                        'PATRONI_POSTGRESQL_DATA_DIR': 'data/test0',
+                                        'NOTIFY_SOCKET': '/run/systemd/notify'}):
                 self.assertRaises(SleepException, _main)
-            with patch.object(Patroni, 'run', Mock(side_effect=KeyboardInterrupt())):
-                with patch('patroni.ha.Ha.is_paused', Mock(return_value=True)):
-                    os.environ['PATRONI_POSTGRESQL_DATA_DIR'] = 'data/test0'
-                    _main()
+            with patch.object(Patroni, 'run', Mock(side_effect=KeyboardInterrupt())), \
+                    patch.dict(os.environ, {'PATRONI_POSTGRESQL_DATA_DIR': 'data/test0'}), \
+                    patch('patroni.ha.Ha.is_paused', Mock(return_value=True)):
+                _main()
 
     @patch('os.getpid')
     @patch('multiprocessing.Process')
@@ -191,7 +206,7 @@ class TestPatroni(unittest.TestCase):
         self.p.ha.cluster = Mock()
         self.p.ha.dcs.watch = Mock(return_value=True)
         self.p.schedule_next_run()
-        self.p.next_run = time.time() - self.p.dcs.loop_wait - 1
+        self.p.next_run = time.monotonic() - self.p.dcs.loop_wait - 1
         self.p.schedule_next_run()
 
     def test__filter_tags(self):
@@ -263,10 +278,110 @@ class TestPatroni(unittest.TestCase):
         self.p.tags['replicatefrom'] = 'foo'
         self.assertEqual(self.p.replicatefrom, 'foo')
 
+    @patch('patroni.config.Config.reload_local_configuration', Mock(return_value=True))
     def test_reload_config(self):
         self.p.reload_config()
         self.p._get_tags = Mock(side_effect=Exception)
         self.p.reload_config(local=True)
+
+    def test_reload_config_checks_certificate_when_local_config_changed(self):
+        """A renewed certificate must be detected even when the local config changed too."""
+        self.p.api.reload_local_certificate = Mock(return_value=True)
+        self.p.reload_config(sighup=True, local=True)
+        self.p.api.reload_local_certificate.assert_called_once()
+
+    def test_reload_config_updates_effective_role(self):
+        """Test that reload_config updates _last_effective_role based on current role."""
+        # When role is UNINITIALIZED, _last_effective_role should be None
+        self.p.postgresql.set_role(PostgresqlRole.UNINITIALIZED)
+        self.p.reload_config()
+        self.assertIsNone(self.p._last_effective_role)
+
+        # When role is REPLICA, _last_effective_role should be REPLICA
+        self.p.postgresql.set_role(PostgresqlRole.REPLICA)
+        self.p.reload_config()
+        self.assertEqual(self.p._last_effective_role, PostgresqlRole.REPLICA)
+
+        # When role is PRIMARY, _last_effective_role should be PRIMARY
+        self.p.postgresql.set_role(PostgresqlRole.PRIMARY)
+        self.p.reload_config()
+        self.assertEqual(self.p._last_effective_role, PostgresqlRole.PRIMARY)
+
+    @patch('patroni.config.Config.save_cache', Mock())
+    @patch('patroni.config.Config.set_dynamic_configuration', Mock(return_value=False))
+    @patch.object(Postgresql, 'reload_config')
+    def test_run_cycle_role_change_triggers_reload(self, mock_pg_reload):
+        """Test that _run_cycle detects role changes and reloads PostgreSQL config."""
+        self.p.ha.run_cycle = Mock(return_value='no action')
+        self.p.ha.dcs.watch = Mock(return_value=True)
+
+        # Start with _last_effective_role = None (simulating startup)
+        self.p._last_effective_role = None
+        self.p._last_effective_pg_config = self.p.config['postgresql']
+
+        # Set role to REPLICA
+        self.p.postgresql.set_role(PostgresqlRole.REPLICA)
+
+        # Add role-specific parameters to config to ensure effective config differs
+        self.p.config['postgresql']['parameters_replica'] = {'work_mem': '32MB'}
+
+        # Run a cycle - should detect role change and reload
+        mock_pg_reload.reset_mock()
+        self.p._run_cycle()
+
+        # Should have called postgresql.reload_config due to role change
+        self.assertTrue(mock_pg_reload.called)
+        self.assertEqual(self.p._last_effective_role, PostgresqlRole.REPLICA)
+
+    @patch('patroni.config.Config.save_cache', Mock())
+    @patch('patroni.config.Config.set_dynamic_configuration', Mock(return_value=False))
+    @patch.object(Postgresql, 'reload_config')
+    def test_run_cycle_no_reload_when_role_unchanged(self, mock_pg_reload):
+        """Test that _run_cycle does not reload when role hasn't changed."""
+        self.p.ha.run_cycle = Mock(return_value='no action')
+        self.p.ha.dcs.watch = Mock(return_value=True)
+
+        # Set role to REPLICA and mark it as already processed
+        self.p.postgresql.set_role(PostgresqlRole.REPLICA)
+        self.p._last_effective_role = PostgresqlRole.REPLICA
+        self.p._last_effective_pg_config = \
+            self.p.config.build_effective_postgresql_configuration(PostgresqlRole.REPLICA)
+
+        # Run a cycle - should NOT reload since role hasn't changed
+        mock_pg_reload.reset_mock()
+        self.p._run_cycle()
+
+        # Should NOT have called postgresql.reload_config
+        self.assertFalse(mock_pg_reload.called)
+
+    @patch('patroni.config.Config.save_cache', Mock())
+    @patch('patroni.config.Config.set_dynamic_configuration', Mock(return_value=False))
+    @patch.object(Postgresql, 'reload_config')
+    def test_run_cycle_role_change_replica_to_primary(self, mock_pg_reload):
+        """Test that _run_cycle handles role transition from REPLICA to PRIMARY."""
+        self.p.ha.run_cycle = Mock(return_value='no action')
+        self.p.ha.dcs.watch = Mock(return_value=True)
+
+        # Start as REPLICA
+        self.p.postgresql.set_role(PostgresqlRole.REPLICA)
+        self.p._last_effective_role = PostgresqlRole.REPLICA
+        self.p._last_effective_pg_config = \
+            self.p.config.build_effective_postgresql_configuration(PostgresqlRole.REPLICA)
+
+        # Add role-specific parameters to ensure configs differ
+        self.p.config['postgresql']['parameters_primary'] = {'work_mem': '128MB'}
+        self.p.config['postgresql']['parameters_replica'] = {'work_mem': '32MB'}
+
+        # Transition to PRIMARY
+        self.p.postgresql.set_role(PostgresqlRole.PRIMARY)
+
+        # Run a cycle - should detect role change and reload
+        mock_pg_reload.reset_mock()
+        self.p._run_cycle()
+
+        # Should have called postgresql.reload_config due to role change
+        self.assertTrue(mock_pg_reload.called)
+        self.assertEqual(self.p._last_effective_role, PostgresqlRole.PRIMARY)
 
     def test_nosync(self):
         self.p.tags['nosync'] = True
@@ -296,6 +411,8 @@ class TestPatroni(unittest.TestCase):
         with patch('builtins.__import__', mock_import):
             self.assertIsNone(check_psycopg())
         with patch('builtins.__import__', mock_import2):
+            self.assertIsNone(check_psycopg())
+        with patch('builtins.__import__', mock_import3):
             self.assertRaises(SystemExit, check_psycopg)
 
     def test_ensure_unique_name(self):

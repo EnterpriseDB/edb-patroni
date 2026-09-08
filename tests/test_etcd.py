@@ -196,7 +196,7 @@ class TestClient(unittest.TestCase):
         self.client._base_uri = 'http://localhost:4001'
         rtry = Retry(deadline=10, max_delay=1, max_tries=-1, retry_exceptions=(etcd.EtcdLeaderElectionInProgress,))
         rtry(self.client.api_execute, '/', 'POST', timeout=0, params={'retry': rtry})
-        self.client._machines_cache_updated = 0
+        self.client._machines_cache_updated = float('-inf')
         self.client.api_execute('/', 'POST', timeout=0)
         self.client._machines_cache = [self.client._base_uri]
         self.assertRaises(etcd.EtcdWatchTimedOut, self.client.api_execute, '/timeout', 'POST', params={'wait': 'true'})
@@ -267,7 +267,7 @@ class TestEtcd(unittest.TestCase):
     @patch.object(EtcdClient, '_get_machines_list',
                   Mock(return_value=['http://localhost:2379', 'http://localhost:4001']))
     def setUp(self):
-        self.etcd = Etcd({'namespace': '/patroni/', 'ttl': 30, 'retry_timeout': 10,
+        self.etcd = Etcd({'site': 'dc1', 'namespace': '/patroni/', 'ttl': 30, 'retry_timeout': 10,
                           'host': 'localhost:2379', 'scope': 'test', 'name': 'foo'}, get_mpp({}))
 
     def test_base_path(self):
@@ -332,7 +332,7 @@ class TestEtcd(unittest.TestCase):
 
     def test_update_leader(self):
         cluster = self.etcd.get_cluster()
-        self.assertTrue(self.etcd.update_leader(cluster, None, failsafe={'foo': 'bar'}))
+        self.assertTrue(self.etcd.update_leader(cluster, 1, failsafe={'foo': 'bar'}))
         with patch.object(etcd.Client, 'write',
                           Mock(side_effect=[etcd.EtcdConnectionFailed, etcd.EtcdClusterIdChanged, Exception])):
             self.assertRaises(EtcdError, self.etcd.update_leader, cluster, None)

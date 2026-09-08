@@ -7,9 +7,12 @@ YAML Configuration Settings
 
 Global/Universal
 ----------------
--  **name**: the name of the host. Must be unique for the cluster.
--  **namespace**: path within the configuration store where Patroni will keep information about the cluster. Default value: "/service"
--  **scope**: cluster name
+-  **thread\_pool\_size**: size of thread pool used by Patroni to execute asynchronous tasks and communicate via REST API with other members during leader race or failsafe checks. Minimal value is ``5``, default value is ``5``.
+-  **thread\_stack\_size**: specifies the stack size to be used for threads started by Patroni. Value must be aligned by ``64kB``. Minimal value is ``64kB``,  default value (set by Patroni) is ``512kB``.
+-  **name**: the name of the host. Must be unique for the cluster. The value ``__patroni_strict_sync_replica_placeholder__`` is reserved for internal use by Patroni and cannot be used as a node name.
+-  **namespace**: path within the configuration store where Patroni will keep information about the cluster. Default value: "/service".
+-  **scope**: cluster name.
+-  **site**: optional string name of the physical site or location where this Patroni node runs, such as a data center, availability zone, or region. When configured, Patroni records it in member metadata and uses it to prefer local automatic failover to the site where the last known leader is located, while also helping to prefer local clone sources for replica bootstrap and ``patronictl reinit``.
 
 .. _log_settings:
 
@@ -161,7 +164,7 @@ ZooKeeper
 -  **key**: (optional) File with the client key.
 -  **key_password**: (optional) The client key password.
 -  **verify**: (optional) Whether to verify certificate or not. Defaults to ``true``.
--  **set_acls**: (optional) If set, configure Kazoo to apply a default ACL to each ZNode that it creates. ACLs will assume 'x509' schema and should be specified as a dictionary with the principal as the key and one or more permissions as a list in the value.  Permissions may be one of ``CREATE``, ``READ``, ``WRITE``, ``DELETE`` or ``ADMIN``.  For example, ``set_acls: {CN=principal1: [CREATE, READ], CN=principal2: [ALL]}``.
+-  **set_acls**: (optional) If set, configures Kazoo to apply a default ACL to each ZNode that it creates. ACLs can use either the `x509` schema (default) or other supported ZooKeeper schemes such as `digest`. They should be specified as a dictionary where the key is the full principal (optionally prefixed with the scheme) and the value is a list of permissions. Permissions may be one or more of ``CREATE``, ``READ``, ``WRITE``, ``DELETE``, ``ADMIN``, or ``ALL``. For example, ``set_acls: {CN=principal1: [CREATE, READ], digest:principal2:+pjROuBuuwNNSujKyH8dGcEnFPQ=: [ALL]}``.
 -  **auth_data**: (optional) Authentication credentials to use for the connection. Should be a dictionary in the form that `scheme` is the key and `credential` is the value. Defaults to empty dictionary.
 
 .. note::
@@ -204,6 +207,18 @@ Raft (deprecated)
 -  **partner\_addrs**: list of other Patroni nodes in the cluster in format: ['ip1:port', 'ip2:port', 'etc...']
 -  **data\_dir**: directory where to store Raft log and snapshot. If not specified the current working directory is used.
 -  **password**: (optional) Encrypt Raft traffic with a specified password, requires ``cryptography`` python module.
+-  **min\_timeout**: (optional) minimum election timeout in seconds for the underlying pysyncobj Raft implementation. Must be greater than 3 \* ``append_entries_period``. Default: ``0.4``.
+-  **max\_timeout**: (optional) maximum election timeout in seconds for the underlying pysyncobj Raft implementation. Must be greater than ``min_timeout``. Default: ``1.4``.
+-  **connection\_timeout**: (optional) time in seconds after which a connection with no data received is considered dead. Must be greater than or equal to ``max_timeout``. Default: ``3.5``.
+-  **append\_entries\_period**: (optional) interval in seconds for sending heartbeat (append\_entries) commands. Must be less than one-third of ``min_timeout``. Default: ``0.1``.
+-  **connection\_retry\_time**: (optional) interval in seconds between reconnection attempts to offline nodes. Default: ``5.0``.
+-  **leader\_fallback\_timeout**: (optional) time in seconds after which a leader with no response from the majority falls back to follower state. Must be greater than ``append_entries_period``. Default: ``30.0``.
+
+.. note::
+   These timeout parameters are useful for high-latency networks where the default pysyncobj timeouts are too aggressive. The following constraints must be satisfied: ``min_timeout`` > 3 \* ``append_entries_period``, ``max_timeout`` > ``min_timeout``, ``connection_timeout`` >= ``max_timeout``, and ``leader_fallback_timeout`` > ``append_entries_period``. Patroni validates these at startup and will refuse to start if they are violated. These values cannot be changed at runtime and require a restart.
+
+   .. warning::
+      These knobs only relax the pysyncobj *election* and *connection* timeouts; they do not extend the per-command deadline that Patroni applies to Raft operations. Each Raft command (leader-lock refresh, cluster-state write) must still complete within ``retry_timeout`` (default ``10``). On very high-latency links — roughly above a few seconds of round-trip time — a single command can exceed ``retry_timeout`` even when ``connection_timeout`` is raised well above the RTT, so the DCS will appear unreachable and the primary may demote. On such links you must also raise ``retry_timeout`` (and ``ttl`` accordingly, keeping ``loop_wait + 2 * retry_timeout <= ttl``) for the Raft DCS to survive; see :ref:`dynamic_configuration`.
 
    Short FAQ about Raft implementation
 
@@ -310,16 +325,39 @@ PostgreSQL
    -  **recovery\_conf**: additional configuration settings written to recovery.conf when configuring follower.
    -  **custom\_conf** : path to an optional custom ``postgresql.conf`` file, that will be used in place of ``postgresql.base.conf``. The file must exist on all cluster nodes, be readable by PostgreSQL and will be included from its location on the real ``postgresql.conf``. Note that Patroni will not monitor this file for changes, nor backup it. However, its settings can still be overridden by Patroni's own configuration facilities - see :ref:`dynamic configuration <patroni_configuration>` for details.
    -  **parameters**: configuration parameters (GUCs) for Postgres in format ``{ssl: "on", ssl_cert_file: "cert_file"}``.
+   -  **parameters_primary**: (optional) role-specific parameter overrides for primary. These values are merged with and override the base **parameters**.
+   -  **parameters_replica**: (optional) role-specific parameter overrides for replica. These values are merged with and override the base **parameters**.
+   -  **parameters_standby_leader**: (optional) role-specific parameter overrides for standby_leader. These values are merged with and override the base **parameters**.
    -  **pg\_hba**: list of lines that Patroni will use to generate ``pg_hba.conf``. Patroni ignores this parameter if ``hba_file`` PostgreSQL parameter is set to a non-default value. Together with :ref:`dynamic configuration <dynamic_configuration>` this parameter simplifies management of ``pg_hba.conf``.
 
       -  **- host all all 0.0.0.0/0 md5**
       -  **- host replication replicator 127.0.0.1/32 md5**: A line like this is required for replication.
+   -  **pg\_hba\_primary**: (optional) role-specific pg_hba entries for primary. These completely replace **pg_hba** (no merging). If not defined, **pg_hba** is used.
+   -  **pg\_hba\_replica**: (optional) role-specific pg_hba entries for replica. These completely replace **pg_hba** (no merging). If not defined, **pg_hba** is used.
+   -  **pg\_hba\_standby\_leader**: (optional) role-specific pg_hba entries for standby_leader. These completely replace **pg_hba** (no merging). If not defined, **pg_hba** is used.
    -  **pg\_ident**: list of lines that Patroni will use to generate ``pg_ident.conf``. Patroni ignores this parameter if ``ident_file`` PostgreSQL parameter is set to a non-default value. Together with :ref:`dynamic configuration <dynamic_configuration>` this parameter simplifies management of ``pg_ident.conf``.
 
       -  **- mapname1 systemname1 pguser1**
       -  **- mapname1 systemname2 pguser2**
+   -  **pg\_ident\_primary**: (optional) role-specific pg_ident entries for primary. These completely replace **pg_ident** (no merging). If not defined, **pg_ident** is used.
+   -  **pg\_ident\_replica**: (optional) role-specific pg_ident entries for replica. These completely replace **pg_ident** (no merging). If not defined, **pg_ident** is used.
+   -  **pg\_ident\_standby\_leader**: (optional) role-specific pg_ident entries for standby_leader. These completely replace **pg_ident** (no merging). If not defined, **pg_ident** is used.
+   -  **pg\_hosts**: (PostgreSQL 19+ only) list of lines that Patroni will use to generate ``pg_hosts.conf``. Patroni ignores this parameter if ``hosts_file`` PostgreSQL parameter is set to a non-default value. Together with :ref:`dynamic configuration <dynamic_configuration>` this parameter simplifies management of ``pg_hosts.conf``.
+   -  **pg\_hosts\_primary**: (optional) role-specific pg_hosts entries for primary. These completely replace **pg_hosts** (no merging). If not defined, **pg_hosts** is used.
+   -  **pg\_hosts\_replica**: (optional) role-specific pg_hosts entries for replica. These completely replace **pg_hosts** (no merging). If not defined, **pg_hosts** is used.
+   -  **pg\_hosts\_standby\_leader**: (optional) role-specific pg_hosts entries for standby_leader. These completely replace **pg_hosts** (no merging). If not defined, **pg_hosts** is used.
    -  **pg\_ctl\_timeout**: How long should pg_ctl wait when doing ``start``, ``stop`` or ``restart``. Default value is 60 seconds.
    -  **use\_pg\_rewind**: try to use pg\_rewind on the former leader when it joins cluster as a replica. Either the cluster must be initialized with ``data page checksums`` (``--data-checksums`` option for ``initdb``) and/or ``wal_log_hints`` must be set to ``on``, or ``pg_rewind`` will not work.
+   -  **rewind**: (optional) custom options to pass to the ``pg_rewind`` command. Can be specified as a list of strings and/or single key-value dictionaries. Not allowed options include: ``target-pgdata``, ``source-pgdata``, ``source-server``, ``write-recovery-conf``, ``dry-run``, ``restore-target-wal``, ``config-file``, ``no-ensure-shutdown``, ``version``, and ``help``. When the ``progress`` option is used, the ``pg_rewind`` output is streamed to the Patroni log as it arrives. Example usage:
+
+      .. code:: YAML
+
+         postgresql:
+           rewind:
+             - debug
+             - progress
+             - sync-method: fsync
+
    -  **remove\_data\_directory\_on\_rewind\_failure**: If this option is enabled, Patroni will remove the PostgreSQL data directory and recreate the replica. Otherwise it will try to follow the new leader. Default value is **false**.
    -  **remove\_data\_directory\_on\_diverged\_timelines**: Patroni will remove the PostgreSQL data directory and recreate the replica if it notices that timelines are diverging and the former primary can not start streaming from the new primary. This option is useful when ``pg_rewind`` can not be used. While performing timelines divergence check on PostgreSQL v10 and older Patroni will try to connect with replication credential to the "postgres" database. Hence, such access should be allowed in the pg_hba.conf. Default value is **false**.
    -  **replica\_method**: for each create_replica_methods other than basebackup, you would add a configuration section of the same name. At a minimum, this should include "command" with a full path to the actual script to be executed. Other configuration parameters will be passed along to the script in the form "parameter=value".
@@ -332,6 +370,7 @@ REST API
 --------
 -  **restapi**:
 
+   -  **thread\_pool\_size**: size of thread pool used by Patroni to process REST API requests. Minimal value is ``5``, default value is ``5``.
    -  **connect\_address**: IP address (or hostname) and port, to access the Patroni's :ref:`REST API <rest_api>`. All the members of the cluster must be able to connect to this address, so unless the Patroni setup is intended for a demo inside the localhost, this address must be a non "localhost" or loopback address (ie: "localhost" or "127.0.0.1"). It can serve as an endpoint for HTTP health checks (read below about the "listen" REST API parameter), and also for user queries (either directly or via the REST API), as well as for the health checks done by the cluster members during leader elections (for example, to determine whether the leader is still running, or if there is a node which has a WAL position that is ahead of the one doing the query; etc.) The connect_address is put in the member key in DCS, making it possible to translate the member name into the address to connect to its REST API.
    -  **listen**: IP address (or hostname) and port that Patroni will listen to for the REST API - to provide also the same health checks and cluster messaging between the participating nodes, as described above. to provide health-check information for HAProxy (or any other load balancer capable of doing a HTTP "OPTION" or "GET" checks).
    -  **authentication**: (optional)
@@ -349,6 +388,8 @@ REST API
    -  **http\_extra\_headers**: (optional): HTTP headers let the REST API server pass additional information with an HTTP response.
    -  **https\_extra\_headers**: (optional): HTTPS headers let the REST API server pass additional information with an HTTP response when TLS is enabled. This will also pass additional information set in ``http_extra_headers``.
    -  **request_queue_size**: (optional): Sets request queue size for TCP socket used by Patroni REST API.  Once the queue is full, further requests get a "Connection denied" error. The default value is 5.
+   -  **handshake\_timeout**: (optional): Maximum time in seconds a single client is given to complete the TLS handshake. Connections that do not complete it in time are closed. It only applies when ``certfile`` is set. The default value is 2.
+   -  **request\_timeout**: (optional): Maximum time in seconds a single client is given to send its request, and to read the response. Connections that stay silent for longer are closed. The default value is 5.
    -  **server_tokens**: (optional): Configures the value of the ``Server`` HTTP header.
       - ``Minimal``: The header will contain only the Patroni version, e.g. ``Patroni/4.0.0``.
       - ``ProductOnly``: The header will contain only the product name, e.g. ``Patroni``.
@@ -412,7 +453,7 @@ Tags
 -  **nosync**: ``true`` or ``false``. If set to ``true`` the node will never be selected as a synchronous replica.
 -  **sync_priority**: integer, controls the priority this node should have during synchronous replica selection when ``synchronous_mode`` is set to ``on``. Nodes with higher priority will be preferred over lower-priority nodes. If the ``sync_priority`` is 0 or negative - such node is not allowed to be written to ``synchronous_standby_names`` PostgreSQL parameter (similar to ``nosync: true``). Keep in mind, that this parameter has the opposite meaning to ``sync_priority`` value reported in ``pg_stat_replication`` view.
 -  **nofailover**: ``true`` or ``false``, controls whether this node is allowed to participate in the leader race and become a leader. Defaults to ``false``, meaning this node _can_ participate in leader races. 
--  **failover_priority**: integer, controls the priority this node should have during failover. Nodes with higher priority will be preferred over lower-priority nodes if they received/replayed the same amount of WAL. However, nodes with higher values of receive/replay LSN are preferred regardless of their priority. If the ``failover_priority`` is 0 or negative - such node is not allowed to participate in the leader race and to become a leader (similar to ``nofailover: true``).
+-  **failover_priority**: integer, controls the priority this node should have during failover. Nodes with higher priority will be preferred over lower-priority nodes if they received/replayed the same amount of WAL. However, nodes with higher values of receive/replay LSN are preferred regardless of their priority. If the ``failover_priority`` is 0 or negative - such node is not allowed to participate in the leader race and to become a leader (similar to ``nofailover: true``). Known limitation: ``failover_priority`` currently doesn't work with :ref:`quorum-based synchronous replication <quorum_mode>`.
 -  **nostream**: ``true`` or ``false``. If set to ``true`` the node will not use replication protocol to stream WAL. It will rely instead on archive recovery (if ``restore_command`` is configured) and ``pg_wal``/``pg_xlog`` polling. It also disables copying and synchronization of permanent logical replication slots on the node itself and all its cascading replicas. Setting this tag on primary node has no effect.
 
 .. warning::
